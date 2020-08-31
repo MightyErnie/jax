@@ -136,6 +136,7 @@ import itertools
 
 from jax import api
 from jax import core
+from jax import custom_derivatives
 from jax import lax
 from jax.lib import pytree
 from jax.interpreters import ad, xla, batching, masking
@@ -175,7 +176,10 @@ def id_tap(tap_func: Callable, arg, *, result=None, **kwargs):
   argument.
 
   Args:
-    * tap_func: the tap function to call.
+    * tap_func: the tap function to call. Must have a signature of the form
+      ``tap_func(arg, *, transforms=None, **kwargs)`` where ``arg`` and
+      ``kwargs`` are as described below and ``transforms`` is an optional
+      sequence describing the applied JAX transformations.
     * arg: the argument passed to the tap function, can be a pytree of JAX
       types.
     * result: if given, specifies the return value of ``id_tap``. This value is
@@ -653,7 +657,43 @@ def _rewrite_eqn(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
             dict(
                 eqn.params,
                 call_jaxpr=_rewrite_jaxpr(call_jaxpr, True,
-                                          True)), eqn.source_info))
+                                          True),
+                donated_invars=eqn.params["donated_invars"] + (False,)
+            ),
+          eqn.source_info))
+  elif eqn.primitive is custom_derivatives.custom_jvp_call_jaxpr_p:
+    fun_jaxpr = eqn.params["fun_jaxpr"]
+    new_invars = [*eqn.invars, input_token_var]
+    def unreachable_thunk():
+      assert False, "Should not be reached"
+    eqns.append(
+        core.new_jaxpr_eqn(
+            new_invars, eqn.outvars + [output_token_var], eqn.primitive,
+            dict(
+                eqn.params,
+                fun_jaxpr=_rewrite_typed_jaxpr(fun_jaxpr, True, True),
+                jvp_jaxpr_thunk=unreachable_thunk
+            ),
+            eqn.source_info))
+  elif eqn.primitive is custom_derivatives.custom_vjp_call_jaxpr_p:
+    fun_jaxpr = eqn.params["fun_jaxpr"]
+    new_invars = [*eqn.invars, input_token_var]
+    def unreachable_thunk():
+      assert False, "Should not be reached"
+    eqns.append(
+        core.new_jaxpr_eqn(
+            new_invars, eqn.outvars + [output_token_var], eqn.primitive,
+            dict(
+                eqn.params,
+                fun_jaxpr=_rewrite_typed_jaxpr(fun_jaxpr, True, True),
+                fwd_jaxpr_thunk=unreachable_thunk,
+                # The following are illegal values for the parameters, they
+                # should not be needed because this rewrite is just before
+                # compilation to XLA, which does not use those parameters.
+                bwd="illegal param",
+                out_trees="illegal param"
+            ),
+            eqn.source_info))
   else:
     raise NotImplementedError(f"outfeed rewrite {eqn.primitive}")
 
@@ -678,7 +718,7 @@ def _rewrite_while_outfeed_cond(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
           dict(
               call_jaxpr=transformed_cond_jaxpr.jaxpr,
               name="cond_before",
-              donated_invars=(False,) * (cond_nconsts + len(carry_invars) + 1)),
+              donated_invars=(False,) * len(transformed_cond_jaxpr.in_avals)),
           eqn.source_info))
   # Make a new cond "lambda pred, carry, token: pred"
   new_cond_pred_invar = mk_new_var(cond_jaxpr.out_avals[0])
@@ -717,9 +757,7 @@ def _rewrite_while_outfeed_cond(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
           dict(
               call_jaxpr=transformed_body_jaxpr.jaxpr,
               name="body",
-              donated_invars=(False,) *
-              (len(new_body_invars_body_constvars) +
-               len(new_body_invars_carry) + 1 + len(new_body_carry2) + 1)),
+              donated_invars=(False,) * len(transformed_body_jaxpr.in_avals)),
           eqn.source_info),
       core.new_jaxpr_eqn(
           new_body_invars_cond_constvars + new_body_carry2 + [new_body_token2],
@@ -727,8 +765,7 @@ def _rewrite_while_outfeed_cond(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
           dict(
               call_jaxpr=transformed_cond_jaxpr.jaxpr,
               name="cond_body",
-              donated_invars=(False,) * (len(new_body_invars_cond_constvars) +
-                                         len(new_body_carry2) + 1 + 2)),
+              donated_invars=(False,) * len(transformed_cond_jaxpr.in_avals)),
           eqn.source_info)
   ]
   new_body_jaxpr = _mk_typed_jaxpr(

@@ -20,12 +20,17 @@ NumPy (lax_reference) or TensorFlow.
 import operator
 from typing import Any, Callable, Dict, Iterable, Optional, NamedTuple, Sequence, Tuple, Union
 
+from functools import partial
+
 from absl import testing
 from jax import config
+from jax import dtypes
 from jax import test_util as jtu
 from jax import lax
 from jax import lax_linalg
 from jax import numpy as jnp
+
+from jaxlib import xla_client
 
 import numpy as np
 
@@ -193,6 +198,83 @@ lax_bitwise_not = tuple(
   ]]
 )
 
+lax_population_count = tuple(
+  Harness(f"{jtu.dtype_str(dtype)}",
+          lax.population_count,
+          [arg],
+          dtype=dtype)
+  for dtype in jtu.dtypes.all_integer + jtu.dtypes.all_unsigned
+  for arg in [
+    np.array([-1, -2, 0, 1], dtype=dtype)
+  ]
+)
+
+def _get_max_identity(dtype):
+  if dtypes.issubdtype(dtype, np.inexact):
+    return np.array(-np.inf, dtype)
+  elif dtypes.issubdtype(dtype, np.integer):
+    return np.array(dtypes.iinfo(dtype).min, dtype)
+  elif dtypes.issubdtype(dtype, np.bool_):
+    return np.array(False, np.bool_)
+
+def _get_min_identity(dtype):
+  if dtypes.issubdtype(dtype, np.inexact):
+    return np.array(np.inf, dtype)
+  elif dtypes.issubdtype(dtype, np.integer):
+    return np.array(dtypes.iinfo(dtype).max, dtype)
+  elif dtypes.issubdtype(dtype, np.bool_):
+    return np.array(True, np.bool_)
+
+lax_add_mul = tuple(
+  Harness(f"fun={f_jax.__name__}_{jtu.dtype_str(dtype)}",
+          f_jax,
+          [lhs, rhs],
+          f_jax=f_jax,
+          dtype=dtype)
+  for f_jax in [lax.add, lax.mul]
+  for dtype in filter(lambda t: t != np.bool_, jtu.dtypes.all)
+  for lhs, rhs in [
+    (np.array([1, 2], dtype=dtype), np.array([3, 4], dtype=dtype))
+  ]
+) + tuple(
+  Harness(f"fun={f_jax.__name__}_bounds_{jtu.dtype_str(dtype)}",
+          f_jax,
+          [StaticArg(lhs), StaticArg(rhs)],
+          f_jax=f_jax,
+          dtype=dtype)
+  for f_jax in [lax.add, lax.mul]
+  for dtype in filter(lambda t: t != np.bool_, jtu.dtypes.all)
+  for lhs, rhs in [
+    (np.array([3, 3], dtype=dtype),
+     np.array([_get_max_identity(dtype), _get_min_identity(dtype)], dtype=dtype))
+  ]
+)
+
+lax_min_max = tuple(
+  Harness(f"fun={f_jax.__name__}_{jtu.dtype_str(dtype)}",
+          f_jax,
+          [lhs, rhs],
+          f_jax=f_jax,
+          dtype=dtype)
+  for f_jax in [lax.min, lax.max]
+  for dtype in jtu.dtypes.all
+  for lhs, rhs in [
+    (np.array([1, 2], dtype=dtype), np.array([3, 4], dtype=dtype))
+  ]
+) + tuple(
+  Harness(f"fun={f_jax.__name__}_inf_nan_{jtu.dtype_str(dtype)}_{lhs[0]}_{rhs[0]}",
+          f_jax,
+          [StaticArg(lhs), StaticArg(rhs)],
+          f_jax=f_jax,
+          dtype=dtype)
+  for f_jax in [lax.min, lax.max]
+  for dtype in jtu.dtypes.all_floating + jtu.dtypes.complex
+  for lhs, rhs in [
+    (np.array([np.inf], dtype=dtype), np.array([np.nan], dtype=dtype)),
+    (np.array([-np.inf], dtype=dtype), np.array([np.nan], dtype=dtype))
+  ]
+)
+
 _LAX_BINARY_ELEMENTWISE = (
   lax.add, lax.atan2, lax.div, lax.igamma, lax.igammac, lax.max, lax.min,
   lax.nextafter, lax.rem, lax.sub)
@@ -301,6 +383,54 @@ lax_gather = tuple(
   ]
 )
 
+lax_scatter = tuple(
+  # Directly from lax.scatter in tests/lax_test.py
+  Harness(
+    f"fun={f_lax.__name__}_shape={jtu.format_shape_dtype_string(shape, dtype)}_scatterindices={scatter_indices.tolist()}_updateshape={update_shape}_updatewindowdims={dimension_numbers.update_window_dims}_insertedwindowdims={dimension_numbers.inserted_window_dims}_scatterdimstooperanddims={dimension_numbers.scatter_dims_to_operand_dims}_indicesaresorted={indices_are_sorted}_uniqueindices={unique_indices}".replace(' ', ''),
+    partial(f_lax, indices_are_sorted=indices_are_sorted,
+            unique_indices=unique_indices),
+    [RandArg(shape, dtype), StaticArg(scatter_indices),
+     RandArg(update_shape, dtype), StaticArg(dimension_numbers)],
+    f_lax=f_lax,
+    shape=shape,
+    dtype=dtype,
+    scatter_indices=scatter_indices,
+    update_shape=update_shape,
+    dimension_numbers=dimension_numbers,
+    indices_are_sorted=indices_are_sorted,
+    unique_indices=unique_indices)
+  # We explicitly decide against testing lax.scatter, as its reduction function
+  # is lambda x, y: y, which is not commutative and thus makes results
+  # non-deterministic when an index into the operand is updated several times.
+  for f_lax in [lax.scatter_min, lax.scatter_max, lax.scatter_mul,
+                lax.scatter_add]
+  for dtype in { lax.scatter_min: jtu.dtypes.all
+               , lax.scatter_max: jtu.dtypes.all
+                 # lax.scatter_mul and lax.scatter_add are not compatible with
+                 # np.bool_ operands.
+               , lax.scatter_mul: filter(lambda t: t != np.bool_, jtu.dtypes.all)
+               , lax.scatter_add: filter(lambda t: t != np.bool_, jtu.dtypes.all)
+               }[f_lax]
+  for shape, scatter_indices, update_shape, dimension_numbers in [
+      ((5,), np.array([[0], [2]]), (2,), lax.ScatterDimensionNumbers(
+        update_window_dims=(), inserted_window_dims=(0,),
+        scatter_dims_to_operand_dims=(0,))),
+      ((10,), np.array([[0], [0], [0]]), (3, 2), lax.ScatterDimensionNumbers(
+        update_window_dims=(1,), inserted_window_dims=(),
+        scatter_dims_to_operand_dims=(0,))),
+      ((10, 5,), np.array([[0], [2], [1]]), (3, 3), lax.ScatterDimensionNumbers(
+        update_window_dims=(1,), inserted_window_dims=(0,),
+        scatter_dims_to_operand_dims=(0,))),
+  ]
+  for indices_are_sorted in [False, True]
+  # `unique_indices` does not affect correctness, only performance, and thus
+  # does not need to be tested here. If/when it will make sense to add a test
+  # with `unique_indices` = True, particular care will have to be taken with
+  # regards to the choice of parameters, as the results are only predictable
+  # when all the indices to be updated are pairwise non-overlapping. Identifying
+  # such cases is non-trivial.
+  for unique_indices in [False]
+)
 
 lax_pad = tuple(
   Harness(f"_inshape={jtu.format_shape_dtype_string(arg_shape, dtype)}_pads={pads}",
@@ -400,9 +530,56 @@ lax_linalg_qr = tuple(
           shape=shape,
           dtype=dtype,
           full_matrices=full_matrices)
-  for dtype in jtu.dtypes.all
+  for dtype in jtu.dtypes.all_floating  + jtu.dtypes.complex
   for shape in [(1, 1), (3, 3), (3, 4), (2, 10, 5), (2, 200, 100)]
   for full_matrices in [False, True]
+)
+
+def _fft_harness_gen(nb_axes):
+  def _fft_rng_factory(dtype):
+    _all_integers = jtu.dtypes.all_integer + jtu.dtypes.all_unsigned + jtu.dtypes.boolean
+    # For integer types, use small values to keep the errors small
+    if dtype in _all_integers:
+      return jtu.rand_small
+    else:
+      return jtu.rand_default
+
+  return tuple(
+    Harness(f"{nb_axes}d_shape={jtu.format_shape_dtype_string(shape, dtype)}_ffttype={fft_type}_fftlengths={fft_lengths}",
+            lax.lax_fft.fft,
+            [RandArg(shape, dtype), StaticArg(fft_type), StaticArg(fft_lengths)],
+            rng_factory=_fft_rng_factory(dtype),
+            shape=shape,
+            dtype=dtype,
+            fft_type=fft_type,
+            fft_lengths=fft_lengths)
+    for dtype in jtu.dtypes.all
+    for shape in filter(lambda x: len(x) >= nb_axes,
+                        [(10,), (12, 13), (14, 15, 16), (14, 15, 16, 17)])
+    for fft_type, fft_lengths in [(xla_client.FftType.FFT, shape[-nb_axes:]),
+                                  (xla_client.FftType.IFFT, shape[-nb_axes:]),
+                                  (xla_client.FftType.RFFT, shape[-nb_axes:]),
+                                  (xla_client.FftType.IRFFT,
+                                   shape[-nb_axes:-1] + ((shape[-1] - 1) * 2,))]
+    if not (dtype in jtu.dtypes.complex and fft_type == xla_client.FftType.RFFT)
+  )
+
+lax_fft = tuple(_fft_harness_gen(1) + _fft_harness_gen(2) + _fft_harness_gen(3) +
+                _fft_harness_gen(4))
+
+lax_linalg_svd = tuple(
+  Harness(f"shape={jtu.format_shape_dtype_string(shape, dtype)}_fullmatrices={full_matrices}_computeuv={compute_uv}",
+          lambda *args: lax_linalg.svd_p.bind(args[0], full_matrices=args[1],
+                                              compute_uv=args[2]),
+          [RandArg(shape, dtype), StaticArg(full_matrices), StaticArg(compute_uv)],
+          shape=shape,
+          dtype=dtype,
+          full_matrices=full_matrices,
+          compute_uv=compute_uv)
+  for dtype in jtu.dtypes.all_floating + jtu.dtypes.complex
+  for shape in [(2, 2), (2, 7), (29, 29), (2, 3, 53), (2, 3, 29, 7)]
+  for full_matrices in [False, True]
+  for compute_uv in [False, True]
 )
 
 lax_slice = tuple(
@@ -436,6 +613,7 @@ lax_slice = tuple(
     [(5,), (5,), (6,), None],
     [(5,), (10,), (11,), None],
     [(5,), (0,), (100,), None],
+    [(5,), (3,), (6,), None]
   ]
   for dtype in [np.float32]
 )
@@ -515,13 +693,153 @@ lax_shift_left = tuple(
 lax_shift_right_logical = tuple(
   Harness(f"_dtype={dtype.__name__}_shift_amount={shift_amount}",  # type: ignore
           lax.shift_right_logical,
-          [arg, StaticArg(np.array([shift_amount], dtype=dtype))])
+          [arg, StaticArg(np.array([shift_amount], dtype=dtype))],
+          dtype=dtype)
   for arg, dtype, shift_amount in shift_inputs
 )
 
 lax_shift_right_arithmetic = tuple(
   Harness(f"_dtype={dtype.__name__}_shift_amount={shift_amount}",  # type: ignore
           lax.shift_right_arithmetic,
-          [arg, StaticArg(np.array([shift_amount], dtype=dtype))])
+          [arg, StaticArg(np.array([shift_amount], dtype=dtype))],
+          dtype=dtype)
   for arg, dtype, shift_amount in shift_inputs
+)
+
+lax_select_and_gather_add = tuple(
+  # Tests with 2d shapes (see tests.lax_autodiff_test.testReduceWindowGrad)
+  Harness(f"2d_shape={jtu.format_shape_dtype_string(shape, dtype)}_selectprim={select_prim}_windowdimensions={window_dimensions}_windowstrides={window_strides}_padding={padding}_basedilation={base_dilation}_windowdilation={window_dilation}",
+          lax._select_and_gather_add,
+          [RandArg(shape, dtype), RandArg(shape, dtype), StaticArg(select_prim),
+           StaticArg(window_dimensions), StaticArg(window_strides),
+           StaticArg(padding), StaticArg(base_dilation),
+           StaticArg(window_dilation)],
+          shape=shape,
+          dtype=dtype,
+          window_dimensions=window_dimensions,
+          window_strides=window_strides,
+          padding=padding,
+          base_dilation=base_dilation,
+          window_dilation=window_dilation)
+  for dtype in jtu.dtypes.all_floating
+  for shape in [(4, 6)]
+  for select_prim in [lax.le_p, lax.ge_p]
+  for window_dimensions in [(2, 1), (1, 2)]
+  for window_strides in [(1, 1), (2, 1), (1, 2)]
+  for padding in tuple(set([tuple(lax.padtype_to_pads(shape, window_dimensions,
+                                                      window_strides, p))
+                            for p in ['VALID', 'SAME']] +
+                           [((0, 3), (1, 2))]))
+  for base_dilation in [(1, 1)]
+  for window_dilation in [(1, 1)]
+) + tuple(
+  # Tests with 4d shapes (see tests.lax_autodiff_test.testReduceWindowGrad)
+  Harness(f"4d_shape={jtu.format_shape_dtype_string(shape, dtype)}_selectprim={select_prim}_windowdimensions={window_dimensions}_windowstrides={window_strides}_padding={padding}_basedilation={base_dilation}_windowdilation={window_dilation}",
+          lax._select_and_gather_add,
+          [RandArg(shape, dtype), RandArg(shape, dtype), StaticArg(select_prim),
+           StaticArg(window_dimensions), StaticArg(window_strides),
+           StaticArg(padding), StaticArg(base_dilation),
+           StaticArg(window_dilation)],
+          shape=shape,
+          dtype=dtype,
+          window_dimensions=window_dimensions,
+          window_strides=window_strides,
+          padding=padding,
+          base_dilation=base_dilation,
+          window_dilation=window_dilation)
+  for dtype in jtu.dtypes.all_floating
+  for shape in [(3, 2, 4, 6)]
+  for select_prim in [lax.le_p, lax.ge_p]
+  for window_dimensions in [(1, 1, 2, 1), (2, 1, 2, 1)]
+  for window_strides in [(1, 2, 2, 1), (1, 1, 1, 1)]
+  for padding in tuple(set([tuple(lax.padtype_to_pads(shape, window_dimensions,
+                                                      window_strides, p))
+                            for p in ['VALID', 'SAME']] +
+                           [((0, 1), (1, 0), (2, 3), (0, 2))]))
+  for base_dilation in [(1, 1, 1, 1)]
+  for window_dilation in [(1, 1, 1, 1)]
+)
+
+lax_reduce_window = tuple(
+  # Tests with 2d shapes (see tests.lax_test.testReduceWindow)
+  Harness(f"2d_shape={jtu.format_shape_dtype_string(shape, dtype)}_initvalue={init_value}_computation={computation.__name__}_windowdimensions={window_dimensions}_windowstrides={window_strides}_padding={padding}_basedilation={base_dilation}_windowdilation={window_dilation}".replace(' ', ''),
+          lax.reduce_window,
+          [RandArg(shape, dtype), StaticArg(init_value), StaticArg(computation),
+           StaticArg(window_dimensions), StaticArg(window_strides),
+           StaticArg(padding), StaticArg(base_dilation), StaticArg(window_dilation)],
+          shape=shape,
+          dtype=dtype,
+          init_value=init_value,
+          computation=computation,
+          window_dimensions=window_dimensions,
+          window_strides=window_strides,
+          padding=padding,
+          base_dilation=base_dilation,
+          window_dilation=window_dilation)
+  for computation in [lax.add, lax.max, lax.min, lax.mul]
+  for dtype in { lax.add: filter(lambda t: t != np.bool_, jtu.dtypes.all)
+               , lax.mul: filter(lambda t: t != np.bool_, jtu.dtypes.all)
+               , lax.max: jtu.dtypes.all
+               , lax.min: jtu.dtypes.all
+               }[computation]
+  for init_value in map(
+      dtype,
+      (lambda ts: ts[0] if not dtype in jtu.dtypes.all_floating else ts[1])(
+          { lax.add: ([0, 1], [0, 1])
+          , lax.mul: ([1], [1])
+          , lax.max: ([1], [-np.inf, 1])
+          , lax.min: ([0], [np.inf, 0])
+          }[computation]
+      )
+  )
+  for shape in [(4, 6)]
+  for window_dimensions in [(1, 2)]
+  for window_strides in [(2, 1)]
+  for padding in tuple(set([tuple(lax.padtype_to_pads(shape, window_dimensions,
+                                                      window_strides, p))
+                            for p in ['VALID', 'SAME']] +
+                           [((0, 3), (1, 2))]))
+  for base_dilation in [(2, 3)]
+  for window_dilation in [(1, 2)]
+) + tuple(
+  # Tests with 4d shapes (see tests.lax_test.testReduceWindow)
+  Harness(f"4d_shape={jtu.format_shape_dtype_string(shape, dtype)}_initvalue={init_value}_computation={computation.__name__}_windowdimensions={window_dimensions}_windowstrides={window_strides}_padding={padding}_basedilation={base_dilation}_windowdilation={window_dilation}".replace(' ', ''),
+          lax.reduce_window,
+          [RandArg(shape, dtype), StaticArg(init_value), StaticArg(computation),
+           StaticArg(window_dimensions), StaticArg(window_strides),
+           StaticArg(padding), StaticArg(base_dilation), StaticArg(window_dilation)],
+          shape=shape,
+          dtype=dtype,
+          init_value=init_value,
+          computation=computation,
+          window_dimensions=window_dimensions,
+          window_strides=window_strides,
+          padding=padding,
+          base_dilation=base_dilation,
+          window_dilation=window_dilation)
+  for computation in [lax.add, lax.max, lax.min, lax.mul]
+  for dtype in { lax.add: filter(lambda t: t != np.bool_, jtu.dtypes.all)
+               , lax.mul: filter(lambda t: t != np.bool_, jtu.dtypes.all)
+               , lax.max: jtu.dtypes.all
+               , lax.min: jtu.dtypes.all
+               }[computation]
+  for init_value in map(
+      dtype,
+      (lambda ts: ts[0] if not dtype in jtu.dtypes.all_floating else ts[1])(
+          { lax.add: ([0, 1], [0, 1])
+          , lax.mul: ([1], [1])
+          , lax.max: ([1], [-np.inf, 1])
+          , lax.min: ([0], [np.inf, 0])
+          }[computation]
+      )
+  )
+  for shape in [(3, 2, 4, 6)]
+  for window_dimensions in [(1, 1, 2, 1)]
+  for window_strides in [(1, 2, 2, 1)]
+  for padding in tuple(set([tuple(lax.padtype_to_pads(shape, window_dimensions,
+                                                      window_strides, p))
+                            for p in ['VALID', 'SAME']] +
+                           [((0, 1), (1, 0), (2, 3), (0, 2))]))
+  for base_dilation in [(2, 1, 3, 2)]
+  for window_dilation in [(1, 2, 2, 1)]
 )

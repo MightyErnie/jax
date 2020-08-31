@@ -9,7 +9,19 @@ Change Log
 
 These are the release notes for JAX.
 
-jax 0.1.74 (July 22, 2020)
+jax 0.1.75 (July 30, 2020)
+--------------------------
+* `GitHub commits <https://github.com/google/jax/compare/jax-v0.1.74...jax-v0.1.75>`_.
+
+* Bug Fixes:
+
+  * make jnp.abs() work for unsigned inputs (#3914)
+
+* Improvements:
+
+  * "Omnistaging" behavior added behind a flag, disabled by default (#3370)
+
+jax 0.1.74 (July 29, 2020)
 --------------------------
 * `GitHub commits <https://github.com/google/jax/compare/jax-v0.1.73...jax-v0.1.74>`_.
 
@@ -25,7 +37,7 @@ jax 0.1.74 (July 22, 2020)
 
 * Improvements:
 
-  * Faster searchsorted implementation (3873)
+  * Faster searchsorted implementation (#3873)
   * Better test coverage for jax.numpy sorting algorithms (#3836)
 
 
@@ -45,6 +57,9 @@ jax 0.1.73 (July 22, 2020)
   * hfft and ihfft (#3664)
   * jax.numpy.intersect1d (#3726)
   * jax.numpy.lexsort (#3812)
+  * ``lax.scan`` and the ``scan`` primitive support an ``unroll``
+    parameter for loop unrolling when lowering to XLA
+    (`#3738 <https://github.com/google/jax/pull/3738>`_).
 
 * Bug Fixes:
 

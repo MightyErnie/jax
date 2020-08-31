@@ -78,9 +78,22 @@ tf.saved_model.save(my_model, '/some/directory')
 restored_model = tf.saved_model.load('/some/directory')
 ```
 
+To explain (TODO):
+
+  * saved model and custom gradients
+  * saved model and XLA
+
 ### Running on GPU
 
 To run jax2tf on GPU, both jaxlib and TensorFlow must be installed with support
 for CUDA. One must be mindful to install a version of CUDA that is compatible
 with both [jaxlib](../../../../../#pip-installation) and
 [TensorFlow](https://www.tensorflow.org/install/source#tested_build_configurations).
+
+## Known limitations
+
+#### Converted functions cannot be differentiated when loaded from SavedModel
+
+TODO
+
+

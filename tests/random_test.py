@@ -126,9 +126,6 @@ class LaxRandomTest(jtu.JaxTestCase):
     N = 10
     key = random.PRNGKey(1701)
     nbits = [8, 16, 32]
-    if jtu.device_under_test() == "tpu":
-      # U8 and U16 are not supported on TPU.
-      nbits = [32]
     rand_bits = [random._random_bits(key, n, (N * 64 // n,)) for n in nbits]
     rand_bits_32 = np.array([np.array(r).view(np.uint32) for r in rand_bits])
     assert np.all(rand_bits_32 == rand_bits_32[0])
@@ -137,15 +134,13 @@ class LaxRandomTest(jtu.JaxTestCase):
     # Test specific outputs to ensure consistent random values between JAX versions.
     key = random.PRNGKey(1701)
 
-    # U8 and U16 are not supported on TPU.
-    if jtu.device_under_test() != "tpu":
-      bits8 = random._random_bits(key, 8, (3,))
-      expected8 = np.array([216, 115,  43], dtype=np.uint8)
-      self.assertArraysEqual(bits8, expected8)
+    bits8 = random._random_bits(key, 8, (3,))
+    expected8 = np.array([216, 115,  43], dtype=np.uint8)
+    self.assertArraysEqual(bits8, expected8)
 
-      bits16 = random._random_bits(key, 16, (3,))
-      expected16 = np.array([41682,  1300, 55017], dtype=np.uint16)
-      self.assertArraysEqual(bits16, expected16)
+    bits16 = random._random_bits(key, 16, (3,))
+    expected16 = np.array([41682,  1300, 55017], dtype=np.uint16)
+    self.assertArraysEqual(bits16, expected16)
 
     bits32 = random._random_bits(key, 32, (3,))
     expected32 = np.array([56197195, 4200222568, 961309823], dtype=np.uint32)
@@ -163,8 +158,6 @@ class LaxRandomTest(jtu.JaxTestCase):
       {"testcase_name": "_dtype={}".format(np.dtype(dtype).name), "dtype": dtype}
       for dtype in float_dtypes))
   def testRngUniform(self, dtype):
-    if jtu.device_under_test() == "tpu" and jnp.dtype(dtype).itemsize < 3:
-      raise SkipTest("random.uniform() not supported on TPU for 16-bit types.")
     key = random.PRNGKey(0)
     rand = lambda key: random.uniform(key, (10000,), dtype)
     crand = api.jit(rand)
@@ -180,8 +173,6 @@ class LaxRandomTest(jtu.JaxTestCase):
       {"testcase_name": "_dtype={}".format(np.dtype(dtype).name), "dtype": dtype}
       for dtype in int_dtypes + uint_dtypes))
   def testRngRandint(self, dtype):
-    if jtu.device_under_test() == "tpu" and jnp.dtype(dtype).itemsize < 3:
-      raise SkipTest("random.randint() not supported on TPU for 8- or 16-bit types.")
     lo = 5
     hi = 10
 
@@ -200,8 +191,6 @@ class LaxRandomTest(jtu.JaxTestCase):
       {"testcase_name": "_dtype={}".format(np.dtype(dtype).name), "dtype": dtype}
       for dtype in [np.float16, np.float32, np.float64]))
   def testNormal(self, dtype):
-    if jtu.device_under_test() == "tpu" and jnp.dtype(dtype).itemsize < 3:
-      raise SkipTest("random.normal() not supported on TPU for 16-bit types.")
     key = random.PRNGKey(0)
     rand = lambda key: random.normal(key, (10000,), dtype)
     crand = api.jit(rand)
@@ -239,11 +228,13 @@ class LaxRandomTest(jtu.JaxTestCase):
       for shape in [(), (5,), (4, 5)]
       for replace in [True, False]
       for weighted in [True, False]
-      for array_input in [True, False]))
+      for array_input in [False, 'jnp', 'np']))
   def testChoice(self, dtype, shape, replace, weighted, array_input):
     N = 100
     key = random.PRNGKey(0)
-    x = N if not array_input else jnp.arange(N, dtype=dtype)
+    x = (N if not array_input else
+         jnp.arange(N, dtype=dtype) if array_input == 'jnp' else
+         np.arange(N, dtype=dtype))
     p = None if not weighted else jnp.arange(N)
     rand = lambda key: random.choice(key, x, shape, p=p, replace=replace)
     crand = api.jit(rand)
@@ -252,7 +243,7 @@ class LaxRandomTest(jtu.JaxTestCase):
     sample2 = crand(key)
 
     self.assertEqual(shape, sample1.shape)
-    if array_input:
+    if array_input == 'jnp':
       self.assertEqual(x.dtype, sample1.dtype)
     if not replace:
       assert len(np.unique(sample1)) == len(np.ravel(sample1))
@@ -380,8 +371,6 @@ class LaxRandomTest(jtu.JaxTestCase):
       {"testcase_name": "_dtype={}".format(np.dtype(dtype).name), "dtype": dtype}
       for dtype in [np.float16, np.float32, np.float64]))
   def testCauchy(self, dtype):
-    if jtu.device_under_test() == "tpu" and jnp.dtype(dtype).itemsize < 3:
-      raise SkipTest("random.cauchy() not supported on TPU for 16-bit types.")
     key = random.PRNGKey(0)
     rand = lambda key: random.cauchy(key, (10000,), dtype)
     crand = api.jit(rand)
@@ -418,8 +407,6 @@ class LaxRandomTest(jtu.JaxTestCase):
       {"testcase_name": "_dtype={}".format(np.dtype(dtype).name), "dtype": dtype}
       for dtype in float_dtypes))
   def testExponential(self, dtype):
-    if jtu.device_under_test() == "tpu" and jnp.dtype(dtype).itemsize < 3:
-      raise SkipTest("random.exponential() not supported on TPU for 16-bit types.")
     key = random.PRNGKey(0)
     rand = lambda key: random.exponential(key, (10000,), dtype)
     crand = api.jit(rand)
@@ -484,8 +471,6 @@ class LaxRandomTest(jtu.JaxTestCase):
       for lam in [0.5, 3, 9, 11, 50, 500]
       for dtype in [np.int16, np.int32, np.int64]))
   def testPoisson(self, lam, dtype):
-    if jtu.device_under_test() == "tpu" and jnp.dtype(dtype).itemsize < 3:
-      raise SkipTest("random.poisson() not supported on TPU for 16-bit types.")
     key = random.PRNGKey(0)
     rand = lambda key, lam: random.poisson(key, lam, (10000,), dtype)
     crand = api.jit(rand)
@@ -530,8 +515,6 @@ class LaxRandomTest(jtu.JaxTestCase):
       {"testcase_name": "_dtype={}".format(np.dtype(dtype).name), "dtype": dtype}
       for dtype in float_dtypes))
   def testLaplace(self, dtype):
-    if jtu.device_under_test() == "tpu" and jnp.dtype(dtype).itemsize < 3:
-      raise SkipTest("random.laplace() not supported on TPU for 16-bit types.")
     key = random.PRNGKey(0)
     rand = lambda key: random.laplace(key, (10000,), dtype)
     crand = api.jit(rand)
@@ -546,8 +529,6 @@ class LaxRandomTest(jtu.JaxTestCase):
       {"testcase_name": "_dtype={}".format(np.dtype(dtype).name), "dtype": dtype}
       for dtype in float_dtypes))
   def testLogistic(self, dtype):
-    if jtu.device_under_test() == "tpu" and jnp.dtype(dtype).itemsize < 3:
-      raise SkipTest("random.logistic() not supported on TPU for 16-bit types.")
     key = random.PRNGKey(0)
     rand = lambda key: random.logistic(key, (10000,), dtype)
     crand = api.jit(rand)
@@ -602,8 +583,6 @@ class LaxRandomTest(jtu.JaxTestCase):
       for dim in [1, 3, 5]
       for dtype in float_dtypes))
   def testMultivariateNormal(self, dim, dtype):
-    if jtu.device_under_test() == "tpu" and jnp.dtype(dtype).itemsize < 3:
-      raise SkipTest("random.multivariate_normal() not supported on TPU for 16-bit types.")
     r = np.random.RandomState(dim)
     mean = r.randn(dim)
     cov_factor = r.randn(dim, dim)
@@ -626,6 +605,31 @@ class LaxRandomTest(jtu.JaxTestCase):
       # uniform mixture of the marginals along the covariance matrix's
       # eigenvectors follow a standard normal distribution.
       self._CheckKolmogorovSmirnovCDF(whitened.ravel(), scipy.stats.norm().cdf)
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+      {"testcase_name": "_dim={}_mean_batch_size={}_cov_batch_size={}_shape={}"\
+       .format(dim, mean_batch_size, cov_batch_size, shape),
+       "dim": dim,
+       "mean_batch_size": mean_batch_size,
+       "cov_batch_size": cov_batch_size,
+       "shape": shape}
+      for dim in [1, 2, 4]
+      for mean_batch_size in [(), (3,), (2, 3)]
+      for cov_batch_size in [(), (3,), (2, 3)]
+      for shape in [(), (1,), (5,)]))
+  def testMultivariateNormalShapes(self, dim, mean_batch_size, cov_batch_size,
+                                   shape):
+    r = np.random.RandomState(0)
+    key = random.PRNGKey(0)
+    eff_batch_size = mean_batch_size \
+      if len(mean_batch_size) > len(cov_batch_size) else cov_batch_size
+    mean = r.randn(*(mean_batch_size + (dim,)))
+    cov_factor = r.randn(*(cov_batch_size + (dim, dim)))
+    cov = np.einsum('...ij,...kj->...ik', cov_factor, cov_factor)
+    cov += 1e-3 * np.eye(dim)
+    shape = shape + eff_batch_size
+    samples = random.multivariate_normal(key, mean, cov, shape=shape)
+    assert samples.shape == shape + (dim,)
 
   def testMultivariateNormalCovariance(self):
     # test code based on https://github.com/google/jax/issues/1869
@@ -730,6 +734,128 @@ class LaxRandomTest(jtu.JaxTestCase):
   def testDtypeErrorMessage(self):
     with self.assertRaisesRegex(ValueError, r"dtype argument to.*"):
       random.normal(random.PRNGKey(0), (), dtype=jnp.int32)
+
+  def testRandomBroadcast(self):
+    """Issue 4033"""
+    # test for broadcast issue in https://github.com/google/jax/issues/4033
+    key = random.PRNGKey(0)
+    shape = (10, 2)
+    x = random.uniform(key, shape, minval=jnp.zeros(2), maxval=jnp.ones(2))
+    assert x.shape == shape
+    x = random.randint(key, shape, jnp.array([0, 1]), jnp.array([1, 2]))
+    assert x.shape == shape
+
+  def testMaxwellSample(self):
+    num_samples = 10**5
+    rng = random.PRNGKey(0)
+
+    rand = lambda x: random.maxwell(x, (num_samples, ))
+    crand = api.jit(rand)
+
+    loc = scipy.stats.maxwell.mean()
+    std = scipy.stats.maxwell.std()
+
+    uncompiled_samples = rand(rng)
+    compiled_samples = crand(rng)
+
+    for samples in [uncompiled_samples, compiled_samples]:
+      # Check first and second moments.
+      self.assertEqual((num_samples,), samples.shape)
+      self.assertAllClose(np.mean(samples), loc, atol=0., rtol=0.1)
+      self.assertAllClose(np.std(samples), std, atol=0., rtol=0.1)
+      self._CheckKolmogorovSmirnovCDF(samples, scipy.stats.maxwell().cdf)
+
+  @parameterized.named_parameters(
+      ('test1', 4.0, 1.0),
+      ('test2', 2.0, 3.0))
+  def testWeibullSample(self, concentration, scale):
+    num_samples = 10**5
+    rng = random.PRNGKey(0)
+
+    rand = lambda x: random.weibull_min(x, scale, concentration, (num_samples,))
+    crand = api.jit(rand)
+
+    loc = scipy.stats.weibull_min.mean(c=concentration, scale=scale)
+    std = scipy.stats.weibull_min.std(c=concentration, scale=scale)
+
+    uncompiled_samples = rand(rng)
+    compiled_samples = crand(rng)
+
+    for samples in [uncompiled_samples, compiled_samples]:
+      # Check first and second moments.
+      self.assertEqual((num_samples,), samples.shape)
+      self.assertAllClose(np.mean(samples), loc, atol=0., rtol=0.1)
+      self.assertAllClose(np.std(samples), std, atol=0., rtol=0.1)
+      self._CheckKolmogorovSmirnovCDF(samples, scipy.stats.weibull_min(
+          c=concentration, scale=scale).cdf)
+
+  @parameterized.named_parameters(
+      ('test1', 4.0, 1.0),
+      ('test2', 2.0, 3.0))
+  def testDoublesidedMaxwellSample(self, loc, scale):
+    num_samples = 10**5
+    rng = random.PRNGKey(0)
+
+    rand = lambda key: random.double_sided_maxwell(
+        rng, loc, scale, (num_samples,))
+    crand = api.jit(rand)
+
+    mean = loc
+    std = np.sqrt(3.) * scale
+
+    uncompiled_samples = rand(rng)
+    compiled_samples = crand(rng)
+
+    # Compute the double sided maxwell CDF through the one sided maxwell cdf.
+    # This is done as follows:
+    # P(DSM <= x) = P (loc + scale * radamacher_sample * one_sided_sample <=x) =
+    # P (radamacher_sample * one_sided_sample <= (x - loc) / scale) =
+    # 1/2 P(one_sided_sample <= (x - loc) / scale)
+    #    + 1/2 P( - one_sided_sample <= (x - loc) / scale) =
+    #  1/2 P(one_sided_sample <= (x - loc) / scale)
+    #    + 1/2 P(one_sided_sample >= - (x - loc) / scale) =
+    # 1/2 CDF_one_maxwell((x - loc) / scale))
+    #   + 1/2 (1 - CDF_one_maxwell(- (x - loc) / scale)))
+    def double_sided_maxwell_cdf(x, loc, scale):
+      pos = scipy.stats.maxwell().cdf((x - loc)/ scale)
+      neg = (1 - scipy.stats.maxwell().cdf((-x + loc)/ scale))
+      return (pos + neg) / 2
+
+    for samples in [uncompiled_samples, compiled_samples]:
+      # Check first and second moments.
+      self.assertEqual((num_samples,), samples.shape)
+      self.assertAllClose(np.mean(samples), mean, atol=0., rtol=0.1)
+      self.assertAllClose(np.std(samples), std, atol=0., rtol=0.1)
+
+      self._CheckKolmogorovSmirnovCDF(
+          samples, lambda x: double_sided_maxwell_cdf(x, loc, scale))
+
+  def testRadamacher(self):
+    rng = random.PRNGKey(0)
+    num_samples = 10**5
+
+    rand = lambda x: random.rademacher(x, (num_samples,))
+    crand = api.jit(rand)
+
+    uncompiled_samples = rand(rng)
+    compiled_samples = crand(rng)
+
+    for samples in [uncompiled_samples, compiled_samples]:
+      unique_values, counts = np.unique(samples, return_counts=True)
+      assert len(unique_values) == 2
+      assert len(counts) == 2
+
+      self.assertAllClose(
+          counts[0]/ num_samples, 0.5, rtol=1e-02, atol=1e-02)
+      self.assertAllClose(
+          counts[1]/ num_samples, 0.5, rtol=1e-02, atol=1e-02)
+
+  def testChoiceShapeIsNotSequenceError(self):
+    key = random.PRNGKey(0)
+    with self.assertRaises(TypeError):
+      random.choice(key, 5, 2, replace=False)
+    with self.assertRaises(TypeError):
+      random.choice(key, 5, 2, replace=True)
 
 
 if __name__ == "__main__":

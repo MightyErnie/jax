@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Callable
 
 from functools import partial
 
@@ -58,17 +59,17 @@ def jet(fun, primals, series):
 
 @lu.transformation
 def jet_fun(order, primals, series):
-  with core.new_master(JetTrace) as master:
-    master.order = order
-    out_primals, out_terms = yield (master, primals, series), {}
-    del master
+  with core.new_main(JetTrace) as main:
+    main.order = order
+    out_primals, out_terms = yield (main, primals, series), {}
+    del main
   out_terms = [[np.zeros_like(p)] * order if s is zero_series else s
                for p, s in zip(out_primals, out_terms)]
   yield out_primals, out_terms
 
 @lu.transformation
-def jet_subtrace(master, primals, series):
-  trace = JetTrace(master, core.cur_sublevel())
+def jet_subtrace(main, primals, series):
+  trace = JetTrace(main, core.cur_sublevel())
   in_tracers = map(partial(JetTracer, trace), primals, series)
   ans = yield in_tracers, {}
   out_tracers = map(trace.full_raise, ans)
@@ -114,7 +115,7 @@ class JetTrace(core.Trace):
     return JetTracer(self, val.primal, val.terms)
 
   def process_primitive(self, primitive, tracers, params):
-    order = self.master.order              # pytype: disable=attribute-error
+    order = self.main.order              # pytype: disable=attribute-error
     primals_in, series_in = unzip2((t.primal, t.terms) for t in tracers)
     series_in = [[zero_term] * order if s is zero_series else s
                  for s in series_in]
@@ -132,13 +133,10 @@ class JetTrace(core.Trace):
   def process_call(self, call_primitive, f, tracers, params):
     primals_in, series_in = unzip2((t.primal, t.terms) for t in tracers)
     primals_and_series, in_tree_def = tree_flatten((primals_in, series_in))
-    f_jet, out_tree_def = traceable(jet_subtrace(f, self.master), in_tree_def)
-    new_params = dict(params)
-    if "donated_invars" in params:
-      if any(params["donated_invars"]):
-        raise ValueError("Buffer donation is not supported with jet.")
-      new_donated_invars = (False,) * len(primals_and_series)
-      new_params["donated_invars"] = new_donated_invars
+    f_jet, out_tree_def = traceable(jet_subtrace(f, self.main), in_tree_def)
+    update_params = call_param_updaters.get(call_primitive)
+    new_params = (update_params(params, len(primals_and_series))
+                  if update_params else params)
     result = call_primitive.bind(f_jet, *primals_and_series, **new_params)
     primals_out, series_out = tree_unflatten(out_tree_def(), result)
     return [JetTracer(self, p, ts) for p, ts in zip(primals_out, series_out)]
@@ -147,10 +145,10 @@ class JetTrace(core.Trace):
     primals, series = unzip2((t.primal, t.terms) for t in out_tracers)
     out, treedef = tree_flatten((primals, series))
     del primals, series
-    master = self.master
+    main = self.main
     def todo(x):
       primals, series = tree_unflatten(treedef, x)
-      trace = JetTrace(master, core.cur_sublevel())
+      trace = JetTrace(main, core.cur_sublevel())
       return map(partial(JetTracer, trace), primals, series)
     return out, todo
 
@@ -165,6 +163,16 @@ register_pytree_node(ZeroTerm, lambda z: ((), None), lambda _, xs: zero_term)
 class ZeroSeries(object): pass
 zero_series = ZeroSeries()
 register_pytree_node(ZeroSeries, lambda z: ((), None), lambda _, xs: zero_series)
+
+
+call_param_updaters = {}
+
+def _xla_call_param_updater(params, num_inputs):
+  donated_invars = params['donated_invars']
+  if any(donated_invars):
+    raise NotImplementedError("donated_invars not supported with jet")
+  return dict(params, donated_invars=(False,) * num_inputs)
+call_param_updaters[xla.xla_call_p] = _xla_call_param_updater
 
 
 ### rule definitions
@@ -226,9 +234,27 @@ deflinear(lax.transpose_p)
 deflinear(lax.slice_p)
 deflinear(lax.reduce_sum_p)
 deflinear(lax.reduce_window_sum_p)
-deflinear(lax.tie_in_p)
 deflinear(lax_fft.fft_p)
 deflinear(xla.device_put_p)
+
+# TODO(mattjj): remove when omnistaging fully lands
+try: deflinear(lax.tie_in_p)
+except AttributeError: pass
+
+def _cumulative_jet_rule(primals_in, series_in, *, axis: int,
+                         prefix_scan: Callable):
+  # Irrespective of backend, we always use the parallel prefix scan
+  # implementation when differentiating because reduce_window is not
+  # arbitrarily differentiable.
+  return jet(partial(prefix_scan, axis=axis), primals_in, series_in)
+
+deflinear(lax.cumsum_p)
+jet_rules[lax.cumprod_p] = partial(_cumulative_jet_rule,
+                                   prefix_scan=lax._cumprod_prefix_scan)
+jet_rules[lax.cummax_p] = partial(_cumulative_jet_rule,
+                                   prefix_scan=lax._cummax_prefix_scan)
+jet_rules[lax.cummin_p] = partial(_cumulative_jet_rule,
+                                   prefix_scan=lax._cummin_prefix_scan)
 
 
 def def_deriv(prim, deriv):

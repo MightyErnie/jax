@@ -63,6 +63,10 @@ JAX_SPECIAL_FUNCTION_RECORDS = [
     op_record("expit", 1, float_dtypes, jtu.rand_small_positive, True),
     # TODO: gammaln has slightly high error.
     op_record("gammaln", 1, float_dtypes, jtu.rand_positive, False),
+    op_record("i0", 1, float_dtypes, jtu.rand_default, True),
+    op_record("i0e", 1, float_dtypes, jtu.rand_default, True),
+    op_record("i1", 1, float_dtypes, jtu.rand_default, True),
+    op_record("i1e", 1, float_dtypes, jtu.rand_default, True),
     op_record("logit", 1, float_dtypes, jtu.rand_uniform, True),
     op_record("log_ndtr", 1, float_dtypes, jtu.rand_default, True),
     op_record("ndtri", 1, float_dtypes, partial(jtu.rand_uniform, low=0.05,
@@ -72,7 +76,7 @@ JAX_SPECIAL_FUNCTION_RECORDS = [
     # TODO(phawkins): gradient of entr yields NaNs.
     op_record("entr", 1, float_dtypes, jtu.rand_default, False),
     op_record("polygamma", 2, (int_dtypes, float_dtypes), jtu.rand_positive, True, (0,)),
-    op_record("xlogy", 2, float_dtypes, jtu.rand_default, True),
+    op_record("xlogy", 2, float_dtypes, jtu.rand_positive, True),
     op_record("xlog1py", 2, float_dtypes, jtu.rand_default, True),
     # TODO: enable gradient test for zeta by restricting the domain of
     # of inputs to some reasonable intervals

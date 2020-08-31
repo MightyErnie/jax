@@ -17,9 +17,11 @@ import os
 from absl.testing import absltest
 
 import jax
+from jax import lax
 import jax.numpy as jnp
 import numpy as np
 import tensorflow as tf  # type: ignore[import]
+import unittest
 
 from jax.experimental import jax2tf
 from jax.experimental.jax2tf.tests import tf_test_util
@@ -52,7 +54,7 @@ class SavedModelTest(tf_test_util.JaxToTfTestCase):
   def test_gradient_disabled(self):
     f_jax = lambda x: x * x
     model = tf.Module()
-    model.f = tf.function(jax2tf.convert(f_jax),
+    model.f = tf.function(jax2tf.convert(f_jax, with_gradient=False),
                           autograph=False,
                           input_signature=[tf.TensorSpec([], tf.float32)])
     x = np.array(0.7)
@@ -99,6 +101,40 @@ class SavedModelTest(tf_test_util.JaxToTfTestCase):
     # is a very strange one, for now.
     with self.assertRaisesRegex(TypeError, "An op outside of the function building code is being passed"):
       _ = tape.gradient(y, xv)
+
+  def _compare_with_saved_model(self, f_jax, *args):
+    # Certain ops are converted to ensure an XLA context, e.g.,
+    # tf.gather, so that the index-out-of-bounds behavior matches that of
+    # JAX. We check that this information is preserved through a savedmodel
+    f_tf = jax2tf.convert(f_jax)
+    res = f_tf(*args)
+
+    model = tf.Module()
+    input_signature = list(tf.TensorSpec(a.shape, a.dtype) for a in args)
+    model.f = tf.function(f_tf,
+                          autograph=False,
+                          input_signature=input_signature)
+    restored_model = self.save_and_load_model(model)
+    res_restored = restored_model.f(*args)
+    self.assertAllClose(res, res_restored)
+
+  def test_xla_context_preserved_slice(self):
+    arr = np.arange(10, dtype=np.float32)
+    def f_jax(arr):
+      return lax.dynamic_slice(arr, [100], [1])  # out of bounds, should return the last element
+    self._compare_with_saved_model(f_jax, arr)
+
+  def test_xla_context_preserved_gather(self):
+    raise unittest.SkipTest("Disable in preparation for fixing b/153556869")
+    def f_jax(arr):
+      return arr[100]  # out of bounds, should return the last element
+    arr = np.arange(10, dtype=np.float32)
+    if jtu.device_under_test() != "tpu":
+      # TODO(b/153556869): the compilation attributes are not saved in savedmodel
+      with self.assertRaisesRegex(BaseException, "Input 2 to .* XlaGather must be a compile-time constant"):
+        self._compare_with_saved_model(f_jax, arr)
+    else:
+      self._compare_with_saved_model(f_jax, arr)
 
 
 if __name__ == "__main__":

@@ -31,13 +31,13 @@ import jax.numpy as jnp
 from jax import core
 from jax import dtypes
 from jax import lax
-from jax import ops
 from jax.util import safe_map, safe_zip, cache, split_list
 from jax.api_util import flatten_fun_nokwargs
 from jax.flatten_util import ravel_pytree
 from jax.tree_util import tree_map, tree_flatten, tree_unflatten
 from jax.interpreters import partial_eval as pe
 from jax import linear_util as lu
+from jax import config
 
 map = safe_map
 zip = safe_zip
@@ -45,11 +45,15 @@ zip = safe_zip
 
 @cache()
 def closure_convert(fun, in_tree, in_avals):
-  in_pvals = [pe.PartialVal.unknown(aval) for aval in in_avals]
-  wrapped_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
-  with core.initial_style_staging():
-    jaxpr, out_pvals, consts = pe.trace_to_jaxpr(
-      wrapped_fun, in_pvals, instantiate=True, stage_out=False)
+  if config.omnistaging_enabled:
+    wrapped_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
+    jaxpr, out_pvals, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, in_avals)
+  else:
+    in_pvals = [pe.PartialVal.unknown(aval) for aval in in_avals]
+    wrapped_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
+    with core.initial_style_staging():
+      jaxpr, out_pvals, consts = pe.trace_to_jaxpr(
+        wrapped_fun, in_pvals, instantiate=True, stage_out=False)
   out_tree = out_tree()
 
   # We only want to closure convert for constants with respect to which we're
@@ -147,9 +151,9 @@ def runge_kutta_step(func, y0, f0, t0, dt):
     ti = t0 + dt * alpha[i-1]
     yi = y0 + dt * jnp.dot(beta[i-1, :], k)
     ft = func(yi, ti)
-    return ops.index_update(k, jax.ops.index[i, :], ft)
+    return k.at[i, :].set(ft)
 
-  k = ops.index_update(jnp.zeros((7, f0.shape[0])), ops.index[0, :], f0)
+  k = jnp.zeros((7, f0.shape[0]), f0.dtype).at[0, :].set(f0)
   k = lax.fori_loop(1, 7, body_fun, k)
 
   y1 = dt * jnp.dot(c_sol, k) + y0
@@ -157,10 +161,16 @@ def runge_kutta_step(func, y0, f0, t0, dt):
   f1 = k[-1]
   return y1, f1, y1_error, k
 
+def abs2(x):
+  if jnp.iscomplexobj(x):
+    return x.real ** 2 + x.imag ** 2
+  else:
+    return x ** 2
+
 def error_ratio(error_estimate, rtol, atol, y0, y1):
   err_tol = atol + rtol * jnp.maximum(jnp.abs(y0), jnp.abs(y1))
   err_ratio = error_estimate / err_tol
-  return jnp.mean(jnp.square(err_ratio))
+  return jnp.mean(abs2(err_ratio))
 
 def optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0,
                       dfactor=0.2, order=5.0):
@@ -270,7 +280,8 @@ def _odeint_rev(func, rtol, atol, mxstep, res, g):
   def scan_fun(carry, i):
     y_bar, t0_bar, args_bar = carry
     # Compute effect of moving measurement time
-    t_bar = jnp.dot(func(ys[i], ts[i], *args), g[i])
+    # `t_bar` should not be complex as it represents time
+    t_bar = jnp.dot(func(ys[i], ts[i], *args), g[i]).real
     t0_bar = t0_bar - t_bar
     # Run augmented system backwards to previous observation
     _, y_bar, t0_bar, args_bar = odeint(

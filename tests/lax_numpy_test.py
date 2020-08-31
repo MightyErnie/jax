@@ -28,6 +28,10 @@ from absl.testing import absltest
 from absl.testing import parameterized
 
 import numpy as np
+try:
+  import numpy_dispatch
+except ImportError:
+  numpy_dispatch = None
 
 import jax
 import jax.ops
@@ -40,10 +44,13 @@ from jax import dtypes
 from jax import tree_util
 from jax.interpreters import partial_eval, xla
 from jax.test_util import check_grads
+from jax.util import prod
 
 from jax.config import config
 config.parse_flags_with_absl()
 FLAGS = config.FLAGS
+
+numpy_version = tuple(map(int, np.version.version.split('.')))
 
 nonempty_nonscalar_array_shapes = [(4,), (3, 4), (3, 1), (1, 4), (2, 1, 4), (2, 3, 4)]
 nonempty_array_shapes = [()] + nonempty_nonscalar_array_shapes
@@ -68,6 +75,9 @@ all_dtypes = number_dtypes + bool_dtypes
 
 
 python_scalar_dtypes = [jnp.bool_, jnp.int_, jnp.float_, jnp.complex_]
+
+# uint64 is problematic because with any uint type it promotes to float:
+int_dtypes_no_uint64 = [d for d in int_dtypes + unsigned_dtypes if d != np.uint64]
 
 def _valid_dtypes_for_shape(shape, dtypes):
   # Not all (shape, dtype) pairs are valid. In particular, Python scalars only
@@ -94,7 +104,8 @@ def op_record(name, nargs, dtypes, shapes, rng_factory, diff_modes,
                   test_name, check_dtypes, tolerance, inexact)
 
 JAX_ONE_TO_ONE_OP_RECORDS = [
-    op_record("abs", 1, number_dtypes, all_shapes, jtu.rand_default, ["rev"]),
+    op_record("abs", 1, number_dtypes + unsigned_dtypes + bool_dtypes,
+              all_shapes, jtu.rand_default, ["rev"]),
     op_record("add", 2, all_dtypes, all_shapes, jtu.rand_default, ["rev"]),
     op_record("ceil", 1, float_dtypes, all_shapes, jtu.rand_default, []),
     op_record("ceil", 1, int_dtypes + unsigned_dtypes, all_shapes,
@@ -114,6 +125,7 @@ JAX_ONE_TO_ONE_OP_RECORDS = [
               jtu.rand_default, [], check_dtypes=False),
     op_record("greater", 2, all_dtypes, all_shapes, jtu.rand_some_equal, []),
     op_record("greater_equal", 2, all_dtypes, all_shapes, jtu.rand_some_equal, []),
+    op_record("ldexp", 2, int_dtypes, all_shapes, jtu.rand_default, [], check_dtypes=False),
     op_record("less", 2, all_dtypes, all_shapes, jtu.rand_some_equal, []),
     op_record("less_equal", 2, all_dtypes, all_shapes, jtu.rand_some_equal, []),
     op_record("log", 1, number_dtypes, all_shapes, jtu.rand_positive, ["rev"],
@@ -154,11 +166,11 @@ JAX_ONE_TO_ONE_OP_RECORDS = [
     op_record("tanh", 1, number_dtypes, all_shapes, jtu.rand_default, ["rev"],
               tolerance={np.float64: 1e-7, np.complex128: 1e-7},
               inexact=True),
-    op_record("arcsin", 1, float_dtypes, all_shapes, jtu.rand_small, ["rev"],
+    op_record("arcsin", 1, number_dtypes, all_shapes, jtu.rand_small, ["rev"],
               inexact=True),
-    op_record("arccos", 1, float_dtypes, all_shapes, jtu.rand_small, ["rev"],
+    op_record("arccos", 1, number_dtypes, all_shapes, jtu.rand_small, ["rev"],
               inexact=True),
-    op_record("arctan", 1, float_dtypes, all_shapes, jtu.rand_small, ["rev"],
+    op_record("arctan", 1, number_dtypes, all_shapes, jtu.rand_small, ["rev"],
               inexact=True),
     op_record("arctan2", 2, float_dtypes, all_shapes, jtu.rand_small, ["rev"],
               inexact=True),
@@ -169,6 +181,13 @@ JAX_ONE_TO_ONE_OP_RECORDS = [
     op_record("arctanh", 1, number_dtypes, all_shapes, jtu.rand_small, ["rev"],
               inexact=True, tolerance={np.float64: 1e-9}),
 ]
+
+# Skip np.i0() tests on older numpy: https://github.com/numpy/numpy/issues/11205
+if numpy_version >= (1, 17, 0):
+  JAX_ONE_TO_ONE_OP_RECORDS.append(
+      op_record("i0", 1, inexact_dtypes, all_shapes, jtu.rand_default, [],
+                tolerance={np.complex64: 1E-5, np.complex128: 1E-14}),
+  )
 
 JAX_COMPOUND_OP_RECORDS = [
     # angle has inconsistent 32/64-bit return types across numpy versions.
@@ -283,6 +302,8 @@ JAX_BITWISE_OP_RECORDS = [
               jtu.rand_bool, []),
     op_record("bitwise_not", 1, int_dtypes + unsigned_dtypes, all_shapes,
               jtu.rand_bool, []),
+    op_record("invert", 1, int_dtypes + unsigned_dtypes, all_shapes,
+              jtu.rand_bool, []),
     op_record("bitwise_or", 2, int_dtypes + unsigned_dtypes, all_shapes,
               jtu.rand_bool, []),
     op_record("bitwise_xor", 2, int_dtypes + unsigned_dtypes, all_shapes,
@@ -350,7 +371,8 @@ JAX_OPERATOR_OVERLOADS = [
     # op_record("__and__", 2, number_dtypes, all_shapes, jtu.rand_default, []),
     # op_record("__xor__", 2, number_dtypes, all_shapes, jtu.rand_bool, []),
     # op_record("__divmod__", 2, number_dtypes, all_shapes, jtu.rand_nonzero, []),
-    # TODO(mattjj): lshift, rshift
+    op_record("__lshift__", 2, int_dtypes_no_uint64, all_shapes, partial(jtu.rand_int, high=8), []),
+    op_record("__rshift__", 2, int_dtypes_no_uint64, all_shapes, partial(jtu.rand_int, high=8), []),
 ]
 
 JAX_RIGHT_OPERATOR_OVERLOADS = [
@@ -369,6 +391,8 @@ JAX_RIGHT_OPERATOR_OVERLOADS = [
     # op_record("__rand__", 2, number_dtypes, all_shapes, jtu.rand_default, []),
     # op_record("__rxor__", 2, number_dtypes, all_shapes, jtu.rand_bool, []),
     # op_record("__rdivmod__", 2, number_dtypes, all_shapes, jtu.rand_nonzero, []),
+    op_record("__rlshift__", 2, int_dtypes_no_uint64, all_shapes, partial(jtu.rand_int, high=8), []),
+    op_record("__rrshift__", 2, int_dtypes_no_uint64, all_shapes, partial(jtu.rand_int, high=8), [])
 ]
 
 class _OverrideEverything(object):
@@ -386,13 +410,12 @@ for rec in JAX_OPERATOR_OVERLOADS + JAX_RIGHT_OPERATOR_OVERLOADS:
     setattr(_OverrideNothing, rec.name, lambda self, other: NotImplemented)
 
 
-numpy_version = tuple(map(int, np.version.version.split('.')))
 if numpy_version >= (1, 15):
   JAX_COMPOUND_OP_RECORDS += [
       op_record("isclose", 2, [t for t in all_dtypes if t != jnp.bfloat16],
                 all_shapes, jtu.rand_small_positive, []),
-      op_record("gcd", 2, int_dtypes, all_shapes, jtu.rand_default, []),
-      op_record("lcm", 2, int_dtypes, all_shapes, jtu.rand_default, []),
+      op_record("gcd", 2, int_dtypes_no_uint64, all_shapes, jtu.rand_default, []),
+      op_record("lcm", 2, int_dtypes_no_uint64, all_shapes, jtu.rand_default, []),
   ]
   JAX_REDUCER_NO_DTYPE_RECORDS += [
       op_record("ptp", 1, number_dtypes, nonempty_shapes, jtu.rand_default, []),
@@ -567,6 +590,26 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       with self.assertRaises(TypeError):
         op(arg, other)
 
+  def testArrayModule(self):
+    if numpy_dispatch is None:
+      raise SkipTest('requires https://github.com/seberg/numpy-dispatch')
+
+    jnp_array = jnp.array(1.0)
+    np_array = np.array(1.0)
+
+    module = numpy_dispatch.get_array_module(jnp_array)
+    self.assertIs(module, jnp)
+
+    module = numpy_dispatch.get_array_module(jnp_array, np_array)
+    self.assertIs(module, jnp)
+
+    def f(x):
+      module = numpy_dispatch.get_array_module(x)
+      self.assertIs(module, jnp)
+      return x
+    jax.jit(f)(jnp_array)
+    jax.grad(f)(jnp_array)
+
   @parameterized.named_parameters(itertools.chain.from_iterable(
       jtu.cases_from_list(
         {"testcase_name": jtu.format_test_name_suffix(
@@ -589,6 +632,35 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     self._CheckAgainstNumpy(np_op, jnp_op, args_maker,
                             check_dtypes=jtu.PYTHON_SCALAR_SHAPE not in shapes)
     self._CompileAndCheck(jnp_op, args_maker)
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+    {"testcase_name": jtu.format_test_name_suffix(op.__name__, shapes, dtypes),
+     "op": op, "dtypes": dtypes, "shapes": shapes}
+    for op in [jnp.left_shift, jnp.right_shift]
+    for shapes in filter(
+      _shapes_are_broadcast_compatible,
+      # TODO numpy always promotes to shift dtype for zero-dim shapes:
+      itertools.combinations_with_replacement(nonzerodim_shapes, 2))
+    for dtypes in itertools.product(
+      *(_valid_dtypes_for_shape(s, int_dtypes_no_uint64) for s in shapes))))
+  def testShiftOpAgainstNumpy(self, op, dtypes, shapes):
+    dtype, shift_dtype = dtypes
+    signed_mix = np.issubdtype(dtype, np.signedinteger) != \
+                 np.issubdtype(shift_dtype, np.signedinteger)
+    has_32 = any(np.iinfo(d).bits == 32 for d in dtypes)
+    promoting_to_64 = has_32 and signed_mix
+    if promoting_to_64 and not FLAGS.jax_enable_x64:
+      self.skipTest("np.right_shift/left_shift promoting to int64"
+                    "differs from jnp in 32 bit mode.")
+
+    info, shift_info = map(np.iinfo, dtypes)
+    x_rng = jtu.rand_int(self.rng(), low=info.min, high=info.max + 1)
+    # NumPy requires shifts to be non-negative and below the bit width:
+    shift_rng = jtu.rand_int(self.rng(), high=max(info.bits, shift_info.bits))
+    args_maker = lambda: (x_rng(shapes[0], dtype), shift_rng(shapes[1], shift_dtype))
+    self._CompileAndCheck(op, args_maker)
+    np_op = getattr(np, op.__name__)
+    self._CheckAgainstNumpy(np_op, op, args_maker)
 
   @parameterized.named_parameters(itertools.chain.from_iterable(
       jtu.cases_from_list(
@@ -1035,10 +1107,10 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
        "shape": shape, "dtype": dtype, "a_min": a_min, "a_max": a_max,
        "rng_factory": jtu.rand_default}
       for shape in all_shapes for dtype in number_dtypes
-      for a_min, a_max in [(-1, None), (None, 1), (-1, 1),
+      for a_min, a_max in [(-1, None), (None, 1), (-0.9, 1),
                            (-np.ones(1), None),
                            (None, np.ones(1)),
-                           (-np.ones(1), np.ones(1))]))
+                           (np.full(1, -0.9), np.ones(1))]))
   def testClipStaticBounds(self, shape, dtype, a_min, a_max, rng_factory):
     rng = rng_factory(self.rng())
     np_fun = lambda x: np.clip(x, a_min=a_min, a_max=a_max)
@@ -1136,7 +1208,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
           jtu.format_shape_dtype_string(shape, dtype), reps),
        "shape": shape, "dtype": dtype, "reps": reps,
        "rng_factory": jtu.rand_default}
-      for reps in [(), (2,), (3, 4), (2, 3, 4)]
+      for reps in [(), (2,), (3, 4), (2, 3, 4), (1, 0, 2)]
       for shape, dtype in _shape_and_dtypes(all_shapes, default_dtypes)
       ))
   def testTile(self, shape, dtype, reps, rng_factory):
@@ -1160,6 +1232,40 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     rng = jtu.rand_some_zero(self.rng())
     args_maker = lambda: [rng(shape, jnp.float32), rng(shape, dtype)]
     self._CheckAgainstNumpy(np.extract, jnp.extract, args_maker)
+
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+      {"testcase_name": "_{}_ncond={}_nfunc={}".format(
+          jtu.format_shape_dtype_string(shape, dtype), ncond, nfunc),
+       "shape": shape, "dtype": dtype, "ncond": ncond, "nfunc": nfunc}
+      for ncond in [1, 2, 3]
+      for nfunc in [ncond, ncond + 1]
+      for shape in nonempty_nonscalar_array_shapes
+      for dtype in all_dtypes))
+  def testPiecewise(self, shape, dtype, ncond, nfunc):
+    rng = jtu.rand_default(self.rng())
+    rng_bool = jtu.rand_int(self.rng(), 0, 2)
+    funclist = [lambda x: x - 1, 1, lambda x: x, 0][:nfunc]
+    args_maker = lambda: (rng(shape, dtype), list(rng_bool((ncond,) + shape, bool)))
+    np_fun = partial(np.piecewise, funclist=funclist)
+    jnp_fun = partial(jnp.piecewise, funclist=funclist)
+    self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker, check_dtypes=True)
+    self._CompileAndCheck(jnp_fun, args_maker, check_dtypes=True)
+
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+    {"testcase_name": "{}_trim={}".format(
+      jtu.format_shape_dtype_string(a_shape, dtype), trim),
+     "dtype": dtype, "a_shape": a_shape, "trim": trim}
+    for dtype in default_dtypes
+    for a_shape in one_dim_array_shapes
+    for trim in ["f", "b", "fb"]))
+  def testTrimZeros(self, a_shape, dtype, trim):
+    rng = jtu.rand_some_zero(self.rng())
+    args_maker = lambda: [rng(a_shape, dtype)]
+    np_fun = lambda arg1: np.trim_zeros(arg1, trim)
+    jnp_fun = lambda arg1: jnp.trim_zeros(arg1, trim)
+    self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker, check_dtypes=True)
 
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -1225,7 +1331,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     if shape in scalar_shapes or len(shape) == 0:
       cond_shape = (0,)
     elif axis is None:
-      cond_shape = (np.prod(shape),)
+      cond_shape = (prod(shape),)
     else:
       cond_shape = (shape[axis],)
 
@@ -1263,7 +1369,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     if shape in scalar_shapes or len(shape) == 0:
       cond_shape = (0,)
     elif axis is None:
-      cond_shape = (np.prod(shape),)
+      cond_shape = (prod(shape),)
     else:
       cond_shape = (shape[axis],)
 
@@ -1755,6 +1861,32 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     jnp_fun = lambda: jnp.identity(n, dtype)
     args_maker = lambda: []
     self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker)
+    self._CompileAndCheck(jnp_fun, args_maker)
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+      {"testcase_name": "_{}_period={}_left={}_right={}".format(
+       jtu.format_shape_dtype_string(shape, dtype), period, left, right),
+       "shape": shape, "dtype": dtype,
+       "period": period, "left": left, "right": right}
+      for shape in nonempty_shapes
+      for period in [None, 0.59]
+      for left in [None, 0]
+      for right in [None, 1]
+      for dtype in default_dtypes
+      # following types lack precision for meaningful tests
+      if dtype not in [np.int8, np.int16, np.float16, jnp.bfloat16]
+  ))
+  def testInterp(self, shape, dtype, period, left, right):
+    rng = jtu.rand_default(self.rng(), scale=10)
+    kwds = dict(period=period, left=left, right=right)
+    np_fun = partial(np.interp, **kwds)
+    jnp_fun = partial(jnp.interp, **kwds)
+    args_maker = lambda: [rng(shape, dtype), np.sort(rng((20,), dtype)), np.linspace(0, 1, 20)]
+
+    # skip numpy comparison for integer types with period specified, because numpy
+    # uses an unstable sort and so results differ for duplicate values.
+    if not (period and np.issubdtype(dtype, np.integer)):
+      self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker, tol={np.float32: 2E-4})
     self._CompileAndCheck(jnp_fun, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2578,7 +2710,21 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     args_maker = lambda: [rng.randn(3, 4).astype("float32")]
     np_op = lambda x: np.asarray(x).astype(jnp.int32)
     jnp_op = lambda x: jnp.asarray(x).astype(jnp.int32)
-    self._CheckAgainstNumpy(jnp_op, np_op, args_maker)
+    self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
+    self._CompileAndCheck(jnp_op, args_maker)
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+      {"testcase_name": "_{}".format(
+          jtu.format_shape_dtype_string(shape, dtype)),
+      "shape": shape, "dtype": dtype}
+      for shape in array_shapes
+      for dtype in all_dtypes))
+  def testNbytes(self, shape, dtype):
+    rng = jtu.rand_default(self.rng())
+    np_op = lambda x: np.asarray(x).nbytes
+    jnp_op = lambda x: jnp.asarray(x).nbytes
+    args_maker = lambda: [rng(shape, dtype)]
+    self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
     self._CompileAndCheck(jnp_op, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2601,7 +2747,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     jnp_op = lambda x: jnp.asarray(x).view(dtype)
     # Above may produce signaling nans; ignore warnings from invalid values.
     with np.errstate(invalid='ignore'):
-      self._CheckAgainstNumpy(jnp_op, np_op, args_maker)
+      self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
       self._CompileAndCheck(jnp_op, args_maker)
 
   def testPathologicalFloats(self):
@@ -2621,7 +2767,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     np_op = lambda x: np.asarray(x).view('float32').view('uint32')
     jnp_op = lambda x: jnp.asarray(x).view('float32').view('uint32')
 
-    self._CheckAgainstNumpy(jnp_op, np_op, args_maker)
+    self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
     self._CompileAndCheck(jnp_op, args_maker)
 
   # TODO(mattjj): test other ndarray-like method overrides
@@ -2659,7 +2805,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     if axis is not None:
       jnp_fun = partial(jnp_fun, axis=axis)
       np_fun = partial(np_fun, axis=axis)
-    self._CheckAgainstNumpy(jnp_fun, np_fun, args_maker)
+    self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker)
     self._CompileAndCheck(jnp_fun, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2676,7 +2822,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       self.skipTest("complex sort not supported on TPU")
     rng = jtu.rand_some_equal(self.rng())
     args_maker = lambda: [rng(shape, dtype)]
-    self._CheckAgainstNumpy(jnp.sort_complex, np.sort_complex, args_maker, check_dtypes=False)
+    self._CheckAgainstNumpy(np.sort_complex, jnp.sort_complex, args_maker, check_dtypes=False)
     self._CompileAndCheck(jnp.sort_complex, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2697,7 +2843,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     args_maker = lambda: [input_type(rng(shape, dtype))]
     jnp_op = lambda x: jnp.lexsort(x, axis=axis)
     np_op = lambda x: np.lexsort(x, axis=axis)
-    self._CheckAgainstNumpy(jnp_op, np_op, args_maker)
+    self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
     self._CompileAndCheck(jnp_op, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2719,7 +2865,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     if axis is not None:
       jnp_fun = partial(jnp_fun, axis=axis)
       np_fun = partial(np_fun, axis=axis)
-    self._CheckAgainstNumpy(jnp_fun, np_fun, args_maker)
+    self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker)
     self._CompileAndCheck(jnp_fun, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2735,7 +2881,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       self.skipTest("complex sort not supported on TPU")
     rng = jtu.rand_some_equal(self.rng())
     args_maker = lambda: [rng(shape, dtype)]
-    self._CheckAgainstNumpy(jnp.msort, np.msort, args_maker)
+    self._CheckAgainstNumpy(np.msort, jnp.msort, args_maker)
     self._CompileAndCheck(jnp.msort, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2761,7 +2907,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     args_maker = lambda: [rng(shape, dtype), np.array(shifts)]
     jnp_op = partial(jnp.roll, axis=axis)
     np_op = partial(np.roll, axis=axis)
-    self._CheckAgainstNumpy(jnp_op, np_op, args_maker)
+    self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
     self._CompileAndCheck(jnp_op, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2780,7 +2926,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     args_maker = lambda: [rng(shape, dtype)]
     jnp_op = partial(jnp.rollaxis, axis=axis, start=start)
     np_op = partial(np.rollaxis, axis=axis, start=start)
-    self._CheckAgainstNumpy(jnp_op, np_op, args_maker)
+    self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
     self._CompileAndCheck(jnp_op, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2800,7 +2946,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     args_maker = lambda: [rng(shape, dtype)]
     jnp_op = partial(jnp.packbits, axis=axis, bitorder=bitorder)
     np_op = partial(np.packbits, axis=axis, bitorder=bitorder)
-    self._CheckAgainstNumpy(jnp_op, np_op, args_maker)
+    self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
     self._CompileAndCheck(jnp_op, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2820,7 +2966,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     args_maker = lambda: [rng(shape, dtype)]
     jnp_op = partial(jnp.unpackbits, axis=axis, bitorder=bitorder)
     np_op = partial(np.unpackbits, axis=axis, bitorder=bitorder)
-    self._CheckAgainstNumpy(jnp_op, np_op, args_maker)
+    self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
     self._CompileAndCheck(jnp_op, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -2847,7 +2993,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     rng_indices = jtu.rand_int(self.rng(), -5, 5)
     jnp_op = lambda x, i: jnp.take(x, i, axis=axis, mode=mode)
     np_op = lambda x, i: np.take(x, i, axis=axis, mode=mode)
-    self._CheckAgainstNumpy(jnp_op, np_op, args_maker)
+    self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
     self._CompileAndCheck(jnp_op, args_maker)
 
   def testTakeEmpty(self):
@@ -2888,7 +3034,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
 
     if hasattr(np, "take_along_axis"):
       np_op = lambda x, i: np.take_along_axis(x, i, axis=axis)
-      self._CheckAgainstNumpy(jnp_op, np_op, args_maker)
+      self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
     self._CompileAndCheck(jnp_op, args_maker)
 
   @parameterized.named_parameters(jtu.cases_from_list(
@@ -3302,6 +3448,11 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     self.assertTrue(xla.is_device_constant(jnp.arange(77)))
     self.assertTrue(xla.is_device_constant(jnp.arange(77, dtype=jnp.int32)))
 
+  def testArangeJit(self):
+    ans = api.jit(lambda: jnp.arange(5))()
+    expected = np.arange(5)
+    self.assertAllClose(ans, expected)
+
   def testIssue830(self):
     a = jnp.arange(4, dtype=jnp.complex64)
     self.assertEqual(a.dtype, jnp.complex64)
@@ -3682,22 +3833,24 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
   @parameterized.named_parameters(
       jtu.cases_from_list(
         {"testcase_name": ("_start_shape={}_stop_shape={}_num={}_endpoint={}"
-                           "_dtype={}").format(
-            start_shape, stop_shape, num, endpoint, dtype),
+                           "_dtype={}_axis={}").format(
+            start_shape, stop_shape, num, endpoint,
+            dtype.__name__ if dtype else "None", axis),
          "start_shape": start_shape,
          "stop_shape": stop_shape,
          "num": num, "endpoint": endpoint,
-         "dtype": dtype, "rng_factory": rng_factory}
+         "dtype": dtype, "axis": axis}
         for start_shape in [(), (2,), (2, 2)]
         for stop_shape in [(), (2,), (2, 2)]
         for num in [0, 1, 2, 5, 20]
         for endpoint in [True, False]
         # NB: numpy's geomspace gives nonsense results on integer types
         for dtype in inexact_dtypes + [None,]
-        for rng_factory in [jtu.rand_default]))
+        for axis in range(-max(len(start_shape), len(stop_shape)),
+                          max(len(start_shape), len(stop_shape)))))
   def testGeomspace(self, start_shape, stop_shape, num,
-                    endpoint, dtype, rng_factory):
-    rng = rng_factory(self.rng())
+                    endpoint, dtype, axis):
+    rng = jtu.rand_default(self.rng())
     # relax default tolerances slightly
     tol = {np.float16: 4e-3, np.float32: 2e-3, np.float64: 1e-14,
            np.complex128: 1e-14}
@@ -3716,23 +3869,21 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       start = start * jnp.sign(start) * jnp.sign(stop)
       return start, stop
     start, stop = args_maker()
-    ndim = len(np.shape(start + stop))
-    for axis in range(-ndim, ndim):
-      def jnp_op(start, stop):
-        return jnp.geomspace(start, stop, num, endpoint=endpoint, dtype=dtype,
-                             axis=axis)
-      def np_op(start, stop):
-        start = start.astype(np.float32) if dtype == jnp.bfloat16 else start
-        stop = stop.astype(np.float32) if dtype == jnp.bfloat16 else stop
-        return np.geomspace(
-          start, stop, num, endpoint=endpoint,
-          dtype=dtype if dtype != jnp.bfloat16 else np.float32,
-          axis=axis).astype(dtype)
-      self._CheckAgainstNumpy(np_op, jnp_op, args_maker,
-                              check_dtypes=False, tol=tol)
-      if dtype in (inexact_dtypes + [None,]):
-        self._CompileAndCheck(jnp_op, args_maker,
-                              check_dtypes=False, atol=tol, rtol=tol)
+    def jnp_op(start, stop):
+      return jnp.geomspace(start, stop, num, endpoint=endpoint, dtype=dtype,
+                           axis=axis)
+    def np_op(start, stop):
+      start = start.astype(np.float32) if dtype == jnp.bfloat16 else start
+      stop = stop.astype(np.float32) if dtype == jnp.bfloat16 else stop
+      return np.geomspace(
+        start, stop, num, endpoint=endpoint,
+        dtype=dtype if dtype != jnp.bfloat16 else np.float32,
+        axis=axis).astype(dtype)
+    self._CheckAgainstNumpy(np_op, jnp_op, args_maker,
+                            check_dtypes=False, tol=tol)
+    if dtype in (inexact_dtypes + [None,]):
+      self._CompileAndCheck(jnp_op, args_maker,
+                            check_dtypes=False, atol=tol, rtol=tol)
 
   def testDisableNumpyRankPromotionBroadcasting(self):
     try:
@@ -3908,7 +4059,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
         lambda: jnp.zeros(1.))
     self.assertRaisesRegex(
         TypeError,
-        "Shapes must be 1D sequences of concrete values of integer type.*\n"
+        r"Shapes must be 1D sequences of concrete values of integer type.*\n"
         "If using `jit`, try using `static_argnums` or applying `jit` to smaller subfunctions.",
         lambda: api.jit(jnp.zeros)(2))
 

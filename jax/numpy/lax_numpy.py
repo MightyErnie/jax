@@ -30,25 +30,27 @@ import operator
 import os
 import types
 from typing import Sequence, Set, Tuple, Union
+from textwrap import dedent as _dedent
 import warnings
 
 import numpy as np
 import opt_einsum
 
+import jax
 from jax import jit, custom_jvp
 from .vectorize import vectorize
 from ._util import _wraps
 from .. import core
 from .. import dtypes
 from ..abstract_arrays import UnshapedArray, ShapedArray, ConcreteArray, canonicalize_shape
-from ..config import flags
-from ..interpreters.xla import (DeviceArray, device_put, array_result_handler,
-                                DeviceValue, abstractify)
+from ..config import flags, config
+from ..interpreters.xla import DeviceArray
 from ..interpreters.masking import Poly
 from .. import lax
+from ..lax.lax import _device_put_raw
 from .. import ops
 from ..util import (partial, unzip2, prod as _prod,
-                    subvals, safe_zip)
+                    subvals, safe_zip, canonicalize_axis as _canonicalize_axis)
 from ..tree_util import tree_leaves, tree_flatten
 
 FLAGS = flags.FLAGS
@@ -202,8 +204,6 @@ load = np.load
 
 ### utility functions
 
-_canonicalize_axis = lax._canonicalize_axis
-
 _DEFAULT_TYPEMAP = {
   np.bool_: bool_,
   np.int_: int_,
@@ -341,31 +341,44 @@ iterable = np.iterable
 def result_type(*args):
   return dtypes.result_type(*args)
 
-def _one_to_one_unop(numpy_fn, lax_fn, promote_to_inexact=False):
+def _one_to_one_unop(numpy_fn, lax_fn, promote_to_inexact=False, lax_doc=False):
   if promote_to_inexact:
     def fn(x):
       x = lax.convert_element_type(x, _to_inexact_dtype(_dtype(x)))
       return lax_fn(x)
   else:
     fn = lambda x: lax_fn(x)
-  return _wraps(numpy_fn)(fn)
+  if lax_doc:
+    doc = _dedent('\n\n'.join(lax_fn.__doc__.split('\n\n')[1:])).strip()
+    return _wraps(numpy_fn, lax_description=doc)(fn)
+  else:
+    return _wraps(numpy_fn)(fn)
 
-def _one_to_one_binop(numpy_fn, lax_fn, promote_to_inexact=False):
+def _one_to_one_binop(numpy_fn, lax_fn, promote_to_inexact=False, lax_doc=False):
   if promote_to_inexact:
     fn = lambda x1, x2: lax_fn(*_promote_args_inexact(numpy_fn.__name__, x1, x2))
   else:
     fn = lambda x1, x2: lax_fn(*_promote_args(numpy_fn.__name__, x1, x2))
-  return _wraps(numpy_fn)(fn)
+  if lax_doc:
+    doc = _dedent('\n\n'.join(lax_fn.__doc__.split('\n\n')[1:])).strip()
+    return _wraps(numpy_fn, lax_description=doc)(fn)
+  else:
+    return _wraps(numpy_fn)(fn)
 
-def _maybe_bool_binop(numpy_fn, lax_fn, bool_lax_fn):
+def _maybe_bool_binop(numpy_fn, lax_fn, bool_lax_fn, lax_doc=False):
   def fn(x1, x2):
     x1, x2 = _promote_args(numpy_fn.__name__, x1, x2)
     return lax_fn(x1, x2) if x1.dtype != bool_ else bool_lax_fn(x1, x2)
   return _wraps(numpy_fn)(fn)
+  if lax_doc:
+    doc = _dedent('\n\n'.join(lax_fn.__doc__.split('\n\n')[1:])).strip()
+    return _wraps(numpy_fn, lax_description=doc)(fn)
+  else:
+    return _wraps(numpy_fn)(fn)
 
-absolute = abs = _one_to_one_unop(np.absolute, lax.abs)
 fabs = _one_to_one_unop(np.fabs, lax.abs, True)
 bitwise_not = _one_to_one_unop(np.bitwise_not, lax.bitwise_not)
+invert = _one_to_one_unop(np.invert, lax.bitwise_not)
 negative = _one_to_one_unop(np.negative, lax.neg)
 positive = _one_to_one_unop(np.positive, lambda x: x)
 
@@ -395,7 +408,6 @@ add = _maybe_bool_binop(np.add, lax.add, lax.bitwise_or)
 bitwise_and = _one_to_one_binop(np.bitwise_and, lax.bitwise_and)
 bitwise_or = _one_to_one_binop(np.bitwise_or, lax.bitwise_or)
 bitwise_xor = _one_to_one_binop(np.bitwise_xor, lax.bitwise_xor)
-right_shift = _one_to_one_binop(np.right_shift, lax.shift_right_arithmetic)
 left_shift = _one_to_one_binop(np.left_shift, lax.shift_left)
 equal = _one_to_one_binop(np.equal, lax.eq)
 multiply = _maybe_bool_binop(np.multiply, lax.mul, lax.bitwise_and)
@@ -405,7 +417,7 @@ arctan2 = _one_to_one_binop(np.arctan2, lax.atan2, True)
 minimum = _one_to_one_binop(np.minimum, lax.min)
 maximum = _one_to_one_binop(np.maximum, lax.max)
 float_power = _one_to_one_binop(np.float_power, lax.pow, True)
-nextafter = _one_to_one_binop(np.nextafter, lax.nextafter, True)
+nextafter = _one_to_one_binop(np.nextafter, lax.nextafter, True, True)
 
 
 def _comparison_op(numpy_fn, lax_fn):
@@ -440,6 +452,21 @@ logical_and = _logical_op(np.logical_and, lax.bitwise_and)
 logical_not = _logical_op(np.logical_not, lax.bitwise_not)
 logical_or = _logical_op(np.logical_or, lax.bitwise_or)
 logical_xor = _logical_op(np.logical_xor, lax.bitwise_xor)
+
+
+@_wraps(np.right_shift)
+def right_shift(x1, x2):
+  x1, x2 = _promote_args(np.right_shift.__name__, x1, x2)
+  lax_fn = lax.shift_right_logical if \
+    np.issubdtype(x1.dtype, np.unsignedinteger) else lax.shift_right_arithmetic
+  return lax_fn(x1, x2)
+
+
+@_wraps(np.absolute)
+def absolute(x):
+  dt = _dtype(x)
+  return x if dt == bool_ or issubdtype(dt, unsignedinteger) else lax.abs(x)
+abs = _wraps(np.abs)(absolute)
 
 
 @_wraps(np.rint)
@@ -730,7 +757,7 @@ _INT_DTYPES = {
 @_wraps(np.ldexp)
 @jit
 def ldexp(x1, x2):
-  dtype = _result_dtype(np.ldexp, x1, x2)
+  dtype = dtypes.canonicalize_dtype(_result_dtype(np.ldexp, x1, x2))
   x1, x2 = _promote_shapes("ldexp", x1, x2)
   x1 = lax.convert_element_type(x1, dtype)
 
@@ -1261,6 +1288,32 @@ else:
   def _maybe_numpy_1_13_isclose_behavior(a, out):
     return out
 
+@_wraps(np.interp)
+def interp(x, xp, fp, left=None, right=None, period=None):
+  if shape(xp) != shape(fp) or ndim(xp) != 1:
+    raise ValueError("xp and fp must be one-dimensional arrays of equal size")
+  x, xp, fp = map(asarray, _promote_dtypes_inexact(x, xp, fp))
+  if period is not None:
+    if period == 0:
+      raise ValueError(f"period must be a non-zero value; got {period}")
+    period = abs(period)
+    x = x % period
+    xp = xp % period
+    xp, fp = lax.sort_key_val(xp, fp)
+    xp = concatenate([xp[-1:] - period, xp, xp[:1] + period])
+    fp = concatenate([fp[-1:], fp, fp[:1]])
+
+  i = clip(searchsorted(xp, x, side='right'), 1, len(xp) - 1)
+  df = fp[i] - fp[i - 1]
+  dx = xp[i] - xp[i - 1]
+  delta = x - xp[i - 1]
+  f = where((dx == 0), fp[i], fp[i - 1] + (delta / dx) * df)
+
+  if period is None:
+    f = where(x < xp[0], fp[0] if left is None else left, f)
+    f = where(x > xp[-1], fp[-1] if right is None else right, f)
+  return f
+
 
 @_wraps(np.in1d, lax_description="""
 In the JAX version, the `assume_unique` argument is not referenced.
@@ -1471,12 +1524,8 @@ def clip(a, a_min=None, a_max=None):
   if a_min is None and a_max is None:
     raise ValueError("At most one of a_min and a_max may be None")
   if a_min is not None:
-    if _dtype(a_min) != _dtype(a):
-      a_min = lax.convert_element_type(a_min, _dtype(a))
     a = maximum(a_min, a)
   if a_max is not None:
-    if _dtype(a_max) != _dtype(a):
-      a_max = lax.convert_element_type(a_max, _dtype(a))
     a = minimum(a_max, a)
   return a
 
@@ -1876,8 +1925,11 @@ def nanvar(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False):
 
   normalizer = sum(logical_not(isnan(a)), axis=axis, keepdims=keepdims)
   normalizer = normalizer - ddof
-  zero = lax.full_like(normalizer, 0, shape=())
-  normalizer_mask = lax.le(normalizer, zero)
+  if config.omnistaging_enabled:
+    normalizer_mask = lax.le(normalizer, 0)
+  else:
+    zero = lax.full_like(normalizer, 0, shape=())
+    normalizer_mask = lax.le(normalizer, zero)
 
   result = nansum(centered, axis, keepdims=keepdims)
   result = where(normalizer_mask, nan, result)
@@ -2100,7 +2152,10 @@ def tile(A, reps):
   A = reshape(A, (1,) * (len(reps) - ndim(A)) + shape(A))
   reps = (1,) * (ndim(A) - len(reps)) + tuple(reps)
   for i, rep in enumerate(reps):
-    A = concatenate([A] * int(rep), axis=i)
+    if rep == 0:
+      A = A[tuple(slice(0 if j == i else None) for j in range(A.ndim))]
+    elif rep != 1:
+      A = concatenate([A] * int(rep), axis=i)
   return A
 
 @_wraps(np.concatenate)
@@ -2235,7 +2290,7 @@ def array(object, dtype=None, copy=True, order="K", ndmin=0):
   if type(object) is np.ndarray:
     out = _device_put_raw(object)
     if dtype: assert _dtype(out) == dtype
-  elif isinstance(object, (DeviceValue, core.Tracer)):
+  elif isinstance(object, (DeviceArray, core.Tracer)):
     if isinstance(object, DeviceArray) and copy:
       # We perform a copy by bouncing back to the host
       # TODO(phawkins): add a device runtime function to copy a buffer
@@ -2265,12 +2320,8 @@ def array(object, dtype=None, copy=True, order="K", ndmin=0):
   return out
 
 def _can_call_numpy_array(x):
-  return _all(not isinstance(l, (core.Tracer, DeviceValue))
+  return _all(not isinstance(l, (core.Tracer, DeviceArray))
               for l in tree_leaves(x))
-
-# TODO(mattjj): maybe move these two functions into xla.py
-def _device_put_raw(x):
-  return array_result_handler(None, abstractify(x))(device_put(x))
 
 
 @_wraps(np.asarray)
@@ -2379,7 +2430,7 @@ def arange(start, stop=None, step=None, dtype=None):
     stop = None if stop is None else require(stop, msg("stop"))
     step = None if step is None else require(step, msg("step"))
     if dtype is None:
-      dtype = _dtype(start, *filter(lambda x: x is not None, [stop, step]))
+      dtype = _dtype(start, *(x for x in [stop, step] if x is not None))
     return array(np.arange(start, stop=stop, step=step, dtype=dtype))
 
 
@@ -2510,6 +2561,12 @@ def meshgrid(*args, **kwargs):
       output[0], output[1] = output[1], output[0]
 
   return output
+
+
+@_wraps(np.i0)
+def i0(x):
+  x = lax.abs(*_promote_args_inexact("i0", x))
+  return lax.mul(lax.exp(x), lax.bessel_i0e(x))
 
 
 @_wraps(np.ix_)
@@ -2802,11 +2859,14 @@ def polyder(p, m=1):
   coeff = (arange(len(p), m, -1) - 1 - arange(m)[:, newaxis]).prod(0)
   return p[:-m] * coeff
 
-def _trim_zeros(a):
-  for i, v in enumerate(a):
-    if v != 0:
-      return a[i:]
-  return a[:0]
+@_wraps(np.trim_zeros)
+def trim_zeros(filt, trim='fb'):
+  nz = asarray(filt) == 0
+  if all(nz):
+    return empty(0, _dtype(filt))
+  start = argmin(nz) if 'f' in trim.lower() else 0
+  end = argmin(nz[::-1]) if 'b' in trim.lower() else 0
+  return filt[start:len(filt) - end]
 
 _LEADING_ZEROS_DOC="""\
 Setting trim_leading_zeros=True makes the output match that of numpy.
@@ -2820,7 +2880,7 @@ def polymul(a1, a2, *, trim_leading_zeros=False):
   if isinstance(a2, np.poly1d):
     a2 = asarray(a2)
   if trim_leading_zeros and (len(a1) > 1 or len(a2) > 1):
-    a1, a2 = _trim_zeros(a1), _trim_zeros(a2)
+    a1, a2 = trim_zeros(a1, trim='f'), trim_zeros(a2, trim='f')
   if len(a1) == 0:
     a1 = asarray([0.])
   if len(a2) == 0:
@@ -3475,7 +3535,8 @@ def _take_along_axis(arr, indices, axis):
       j += 1
     elif idx_shape[i] != 1:
       iota = lax.iota(_dtype(indices), out_shape[i])
-      iota = lax.tie_in(arr, iota)
+      if not config.omnistaging_enabled:
+        iota = lax.tie_in(arr, iota)
       iota = lax.broadcast_in_dim(iota, gather_index_shape, (j,))
       gather_indices.append(iota)
       slice_sizes.append(1)
@@ -3895,9 +3956,9 @@ def _expand_bool_indices(idx):
         abstract_i = core.get_aval(i)
 
       if not type(abstract_i) is ConcreteArray:
-        msg = ("Array boolean indices must be static (e.g. no dependence on an "
-               "argument to a jit or vmap function).")
-        raise IndexError(msg)
+        # TODO(mattjj): improve this error by tracking _why_ the indices are not
+        # concrete
+        raise IndexError("Array boolean indices must be concrete.")
       else:
         out.extend(np.where(i))
     else:
@@ -4010,11 +4071,10 @@ def _gcd_body_fn(xs):
 def gcd(x1, x2):
   if (not issubdtype(_dtype(x1), integer) or
       not issubdtype(_dtype(x2), integer)):
-    raise ValueError("Arguments to gcd must be integers.")
+    raise ValueError("Arguments to jax.numpy.gcd must be integers.")
   x1, x2 = _promote_dtypes(x1, x2)
   x1, x2 = broadcast_arrays(x1, x2)
-  gcd, _ = lax.while_loop(_gcd_cond_fn, _gcd_body_fn,
-                          (lax.abs(x1), lax.abs(x2)))
+  gcd, _ = lax.while_loop(_gcd_cond_fn, _gcd_body_fn, (abs(x1), abs(x2)))
   return gcd
 
 
@@ -4023,7 +4083,7 @@ def lcm(x1, x2):
   x1, x2 = _promote_dtypes(x1, x2)
   d = gcd(x1, x2)
   return where(d == 0, lax._const(d, 0),
-               lax.div(lax.abs(multiply(x1, x2)), d))
+               abs(multiply(x1, floor_divide(x2, d))))
 
 
 @_wraps(np.extract)
@@ -4281,6 +4341,31 @@ def digitize(x, bins, right=False):
     len(bins) - searchsorted(bins[::-1], x, side=side)
   )
 
+_PIECEWISE_DOC = """\
+Unlike `np.piecewise`, :py:func:`jax.numpy.piecewise` requires functions in
+`funclist` to be traceable by JAX, as it is implemeted via :func:`jax.lax.switch`.
+See the :func:`jax.lax.switch` documentation for more information.
+"""
+
+@_wraps(np.piecewise, lax_description=_PIECEWISE_DOC)
+def piecewise(x, condlist, funclist, *args, **kw):
+  condlist = array(condlist, dtype=bool_)
+  nc, nf = len(condlist), len(funclist)
+  if nf == nc + 1:
+    funclist = funclist[-1:] + funclist[:-1]
+  elif nf == nc:
+    funclist = [0] + list(funclist)
+  else:
+    raise ValueError(f"with {nc} condition(s), either {nc} or {nc+1} functions are expected; got {nf}")
+  indices = argmax(cumsum(vstack([zeros_like(condlist[:1]), condlist]), 0), 0)
+  dtype = _dtype(x)
+  def _call(f):
+    return lambda x: f(x, *args, **kw).astype(dtype)
+  def _const(v):
+    return lambda x: full_like(x, v)
+  funclist = [_call(f) if callable(f) else _const(f) for f in funclist]
+  return vectorize(lax.switch, excluded=(1,))(indices, funclist, x)
+
 
 @_wraps(np.percentile)
 def percentile(a, q, axis=None, out=None, overwrite_input=False,
@@ -4311,6 +4396,11 @@ def nanmedian(a, axis=None, out=None, overwrite_input=False, keepdims=False):
 def _astype(arr, dtype):
   lax._check_user_dtype_supported(dtype, "astype")
   return lax.convert_element_type(arr, dtype)
+
+
+def _nbytes(arr):
+  return size(arr) * _dtype(arr).itemsize
+
 
 def _view(arr, dtype=None, type=None):
   if type is not None:
@@ -4434,6 +4524,8 @@ _operators = {
     "invert": bitwise_not,
     "lshift": _defer_to_unrecognized_arg(left_shift),
     "rshift": _defer_to_unrecognized_arg(right_shift),
+    "rlshift": _defer_to_unrecognized_arg(_swap_args(left_shift)),
+    "rrshift": _defer_to_unrecognized_arg(_swap_args(right_shift)),
     "round": _operator_round,
 }
 
@@ -4466,6 +4558,7 @@ setattr(ShapedArray, "real", core.aval_property(real))
 setattr(ShapedArray, "imag", core.aval_property(imag))
 setattr(ShapedArray, "astype", core.aval_method(_astype))
 setattr(ShapedArray, "view", core.aval_method(_view))
+setattr(ShapedArray, "nbytes", core.aval_property(_nbytes))
 
 
 # Forward operators, methods, and properties on DeviceArray to lax_numpy
@@ -4481,6 +4574,22 @@ setattr(DeviceArray, "real", property(real))
 setattr(DeviceArray, "imag", property(imag))
 setattr(DeviceArray, "astype", _astype)
 setattr(DeviceArray, "view", _view)
+setattr(DeviceArray, "nbytes", property(_nbytes))
+
+
+# Experimental support for NumPy's module dispatch with NEP-37.
+# Currently requires https://github.com/seberg/numpy-dispatch
+_JAX_ARRAY_TYPES = (DeviceArray, core.Tracer)
+_HANDLED_ARRAY_TYPES = _JAX_ARRAY_TYPES + (np.ndarray,)
+
+def __array_module__(self, types):
+  if builtins.all(issubclass(t, _HANDLED_ARRAY_TYPES) for t in types):
+    return jax.numpy
+  else:
+    return NotImplemented
+
+setattr(ShapedArray, "_array_module", staticmethod(__array_module__))
+setattr(DeviceArray, "__array_module__", __array_module__)
 
 
 # Extra methods that are handy

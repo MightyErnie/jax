@@ -19,6 +19,7 @@ import itertools
 import operator
 import re
 from unittest import SkipTest
+import textwrap
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -27,6 +28,7 @@ import numpy as np
 import numpy.random as npr
 
 from jax import api
+from jax import core
 from jax import lax
 from jax import random
 from jax import test_util as jtu
@@ -232,17 +234,22 @@ class LaxControlFlowTest(jtu.JaxTestCase):
       lax.while_loop(lambda c: (1., 1.), lambda c: c, 0.)
     with  self.assertRaisesRegex(TypeError,
         re.escape("cond_fun must return a boolean scalar, but got output type(s) [ShapedArray(float32[])].")):
-      lax.while_loop(lambda c: jnp.float32(1.), lambda c: c, jnp.float32(0.))
+      lax.while_loop(lambda c: np.float32(1.), lambda c: c, np.float32(0.))
     with self.assertRaisesRegex(TypeError,
         re.escape("body_fun output and input must have same type structure, got PyTreeDef(tuple, [*,*]) and *.")):
       lax.while_loop(lambda c: True, lambda c: (1., 1.), 0.)
-    with self.assertRaisesWithLiteralMatch(
-        TypeError,
-        "body_fun output and input must have identical types, got\n"
-        "ShapedArray(bool[])\n"
-        "and\n"
-        "ShapedArray(float32[])."):
-      lax.while_loop(lambda c: True, lambda c: True, jnp.float32(0.))
+    if config.omnistaging_enabled:
+      expected = ("body_fun output and input must have identical types, got\n"
+                  "ShapedArray(bool[], weak_type=True)\n"
+                  "and\n"
+                  "ShapedArray(float32[]).")
+    else:
+      expected = ("body_fun output and input must have identical types, got\n"
+                  "ShapedArray(bool[])\n"
+                  "and\n"
+                  "ShapedArray(float32[]).")
+    with self.assertRaisesWithLiteralMatch(TypeError, expected):
+      lax.while_loop(lambda c: True, lambda c: True, np.float32(0.))
 
   def testNestedWhileWithDynamicUpdateSlice(self):
     num = 5
@@ -430,6 +437,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertEqual(count(2), 1)
     self.assertEqual(count(3), 3)
     self.assertEqual(count(4), 6)
+
     for args_maker in [lambda: [2], lambda: [3], lambda: [4]]:
       self._CompileAndCheck(count, args_maker)
 
@@ -693,12 +701,13 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(TypeError,
         re.escape("true_fun and false_fun output must have same type structure, got * and PyTreeDef(tuple, [*,*]).")):
       lax.cond(True, lambda top: 2., lambda fop: (3., 3.), 1.)
-    with self.assertRaisesWithLiteralMatch(
-        TypeError,
-        "true_fun and false_fun output must have identical types, got\n"
-        "ShapedArray(float32[1])\n"
-        "and\n"
-        "ShapedArray(float32[])."):
+    with self.assertRaisesRegex(
+        TypeError, textwrap.dedent(
+            r"""
+            true_fun and false_fun output must have identical types, got
+            ShapedArray\(float32\[1\]\)
+            and
+            ShapedArray\(float32\[\].*\).""").strip()):
       lax.cond(True,
                lambda top: jnp.array([1.], jnp.float32),
                lambda fop: jnp.float32(1.),
@@ -721,12 +730,13 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(TypeError,
         re.escape("branch 0 and 1 outputs must have same type structure, got * and PyTreeDef(tuple, [*,*]).")):
       lax.switch(1, [lambda _: 2., lambda _: (3., 3.)], 1.)
-    with self.assertRaisesWithLiteralMatch(
-        TypeError,
-        "branch 0 and 1 outputs must have identical types, got\n"
-        "ShapedArray(float32[1])\n"
-        "and\n"
-        "ShapedArray(float32[])."):
+    with self.assertRaisesRegex(
+        TypeError, textwrap.dedent(
+            r"""
+            branch 0 and 1 outputs must have identical types, got
+            ShapedArray\(float32\[1\]\)
+            and
+            ShapedArray\(float32\[\].*\).""").strip()):
       lax.switch(1, [lambda _: jnp.array([1.], jnp.float32),
                      lambda _: jnp.float32(1.)],
                  1.)
@@ -1341,10 +1351,10 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     as_ = rng.randn(5, 3)
     c = rng.randn(4)
 
-    ans = api.jvp(lambda c, as_:                scan(f, c, as_), (c, as_), (c, as_))
+    ans = api.jvp(     lambda c, as_:           scan(f, c, as_), (c, as_), (c, as_))
     expected = api.jvp(lambda c, as_: scan_reference(f, c, as_), (c, as_), (c, as_))
     self.assertAllClose(ans, expected, check_dtypes=False,
-                        rtol={np.float64: 1e-14})
+                        rtol={np.float64: 1e-14, np.float32: 1e-5})
 
     jtu.check_grads(partial(scan, f), (c, as_), order=2, modes=["fwd"])
 
@@ -1529,7 +1539,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     # Body output not a tuple
     with self.assertRaisesRegex(TypeError,
         re.escape("scan body output must be a pair, got ShapedArray(float32[]).")):
-      lax.scan(lambda c, x: jnp.float32(0.), 0, a)
+      lax.scan(lambda c, x: np.float32(0.), 0, a)
     with  self.assertRaisesRegex(TypeError,
         re.escape("scan carry output and input must have same type structure, "
                   "got PyTreeDef(tuple, [*,*,*]) and PyTreeDef(tuple, [*,PyTreeDef(tuple, [*,*])])")):
@@ -1543,7 +1553,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
         "ShapedArray(int32[])\n"
         "and\n"
         "ShapedArray(float32[])."):
-      lax.scan(lambda c, x: (jnp.int32(0), x), jnp.float32(1.0), a)
+      lax.scan(lambda c, x: (np.int32(0), x), np.float32(1.0), a)
     with self.assertRaisesRegex(TypeError,
         re.escape("scan carry output and input must have same type structure, got * and PyTreeDef(tuple, [*,*]).")):
       lax.scan(lambda c, x: (0, x), (1, 2), jnp.arange(5))
@@ -1651,7 +1661,6 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     self.assertAllClose(carry_out[1], carry_init, check_dtypes=False)
     self.assertAllClose(carry_out[0], jnp.array([2., 2., 2.]), check_dtypes = False)
 
-
   # TODO(mattjj, dougalm): fix this test when skip_checks is False
   def testIssue757(self):
     # code from https://github.com/google/jax/issues/757
@@ -1672,8 +1681,6 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
     arg = 0.5
     api.jit(api.jacfwd(loop, argnums=(0,)))(arg)  # doesn't crash
-
-  # TODO(mattjj): add a test for "the David Sussillo bug"
 
   def testIssue804(self):
     num_devices = xla_bridge.device_count()
@@ -2393,6 +2400,68 @@ class LaxControlFlowTest(jtu.JaxTestCase):
                         check_dtypes=False)
     self.assertAllClose(result.second, np.array([0., 10., 30.]),
                         check_dtypes=False)
+
+  def test_scan_typecheck_param(self):
+    d = jnp.ones(2)
+    def f(c, a):
+      b = jnp.cos(jnp.sum(a) + jnp.sum(c) + jnp.sum(d))
+      c = jnp.sin(c * b)
+      return c, b
+
+    xs = jnp.ones((5, 3))
+    c = jnp.ones(4)
+    scan_fun = lambda c, xs: lax.scan(f, c, xs)
+
+    def new_jaxpr():
+      jaxpr = api.make_jaxpr(scan_fun)(c, xs).jaxpr
+      scan = next(eqn for eqn in jaxpr.eqns if eqn.primitive.name == 'scan')
+      return jaxpr, scan
+
+    jaxpr, eqn = new_jaxpr()
+    eqn.params['reverse'] = 4
+    self.assertRaisesRegex(
+        core.JaxprTypeError,
+        re.escape('invalid scan param reverse of type int, bool required: 4'),
+        lambda: core.check_jaxpr(jaxpr))
+
+    jaxpr, eqn = new_jaxpr()
+    eqn.params['num_consts'] = -3
+    self.assertRaisesRegex(
+        core.JaxprTypeError,
+        re.escape('invalid scan param num_consts of type int, '
+                  'non-negative int required: -3'),
+        lambda: core.check_jaxpr(jaxpr))
+
+  def test_cond_typecheck_param(self):
+    def new_jaxpr():
+      jaxpr = api.make_jaxpr(
+          lambda x: lax.switch(0, [jnp.sin, jnp.cos], x))(1.).jaxpr
+      cond = next(eqn for eqn in jaxpr.eqns if eqn.primitive.name == 'cond')
+      return jaxpr, cond
+
+    jaxpr, eqn = new_jaxpr()
+    eqn.params['branches'] = (4, 2)
+    self.assertRaisesRegex(
+        core.JaxprTypeError,
+        re.escape('invalid cond param branches of type tuple, '
+                  'tuple of TypedJaxpr required: (4, 2)'),
+        lambda: core.check_jaxpr(jaxpr))
+
+    jaxpr, eqn = new_jaxpr()
+    eqn.params['linear'] = (4, 2)
+    self.assertRaisesRegex(
+        core.JaxprTypeError,
+        re.escape('invalid cond param linear of type tuple, '
+                  'tuple of bool required: (4, 2)'),
+        lambda: core.check_jaxpr(jaxpr))
+
+    jaxpr, eqn = new_jaxpr()
+    eqn.params['linear'] = 'multi\nline'
+    self.assertRaisesRegex(
+        core.JaxprTypeError,
+        r'invalid cond param linear of type str, '
+        r'tuple of bool required:\nmulti\nline',
+        lambda: core.check_jaxpr(jaxpr))
 
 
 if __name__ == '__main__':

@@ -98,6 +98,14 @@ def _is_prng_key(key: jnp.ndarray) -> bool:
 ### utilities
 
 
+# TODO(mattjj,jakevdp): add more info to error message, use this utility more
+def _asarray(x):
+  """A more restrictive jnp.asarray, only accepts JAX arrays and np.ndarrays."""
+  if not isinstance(x, (np.ndarray, jnp.ndarray)):
+    raise TypeError(f"Function requires array input, got {x} of type {type(x)}.")
+  return jnp.asarray(x)
+
+
 def _make_rotate_left(dtype):
   if not jnp.issubdtype(dtype, np.integer):
     raise TypeError("_rotate_left only accepts integer dtypes.")
@@ -264,11 +272,11 @@ def split(key: jnp.ndarray, num: int = 2) -> jnp.ndarray:
   Returns:
     An array with shape (num, 2) and dtype uint32 representing `num` new keys.
   """
-  return _split(key, num)
+  return _split(key, int(num))  # type: ignore
 
 @partial(jit, static_argnums=(1,))
-def _split(key, num):
-  counts = lax.tie_in(key, lax.iota(np.uint32, num * 2))
+def _split(key, num) -> jnp.ndarray:
+  counts = lax.iota(np.uint32, num * 2)
   return lax.reshape(threefry_2x32(key, counts), (num, 2))
 
 
@@ -287,8 +295,7 @@ def fold_in(key, data):
 
 @jit
 def _fold_in(key, data):
-  key2 = lax.tie_in(key, PRNGKey(data))
-  return threefry_2x32(key, key2)
+  return threefry_2x32(key, PRNGKey(data))
 
 
 def _random_bits(key, bit_width, shape):
@@ -297,13 +304,13 @@ def _random_bits(key, bit_width, shape):
     raise TypeError("_random_bits got invalid prng key.")
   if bit_width not in (8, 16, 32, 64):
     raise TypeError("requires 8-, 16-, 32- or 64-bit field width.")
-  size = np.prod(shape)
+  size = prod(shape)
   max_count = int(np.ceil(bit_width * size / 32))
   if max_count >= jnp.iinfo(np.uint32).max:
     # TODO(mattjj): just split the key here
     raise TypeError("requesting more random bits than a single call provides.")
 
-  counts = lax.tie_in(key, lax.iota(np.uint32, max_count))
+  counts = lax.iota(np.uint32, max_count)
   bits = threefry_2x32(key, counts)
   dtype = _UINT_DTYPES[bit_width]
   if bit_width == 64:
@@ -354,8 +361,8 @@ def uniform(key: jnp.ndarray,
       shape. Default ().
     dtype: optional, a float dtype for the returned values (default float64 if
       jax_enable_x64 is true, otherwise float32).
-    minval: optional, a minimum (inclusive) value for the range (default 0).
-    maxval: optional, a maximum (exclusive) value for the range (default 1).
+    minval: optional, a minimum (inclusive) value broadcast-compatible with shape for the range (default 0).
+    maxval: optional, a maximum (exclusive) value broadcast-compatible with shape for the range (default 1).
 
   Returns:
     A random array with the specified shape and dtype.
@@ -365,16 +372,19 @@ def uniform(key: jnp.ndarray,
                      f"got {dtype}")
   dtype = dtypes.canonicalize_dtype(dtype)
   shape = abstract_arrays.canonicalize_shape(shape)
-  return _uniform(key, shape, dtype, minval, maxval)
+  return _uniform(key, shape, dtype, minval, maxval)  # type: ignore
 
 @partial(jit, static_argnums=(1, 2))
-def _uniform(key, shape, dtype, minval, maxval):
+def _uniform(key, shape, dtype, minval, maxval) -> jnp.ndarray:
   _check_shape("uniform", shape)
   if not jnp.issubdtype(dtype, np.floating):
     raise TypeError("uniform only accepts floating point dtypes.")
 
   minval = lax.convert_element_type(minval, dtype)
   maxval = lax.convert_element_type(maxval, dtype)
+  minval = lax.broadcast_to_rank(minval, len(shape))
+  maxval = lax.broadcast_to_rank(maxval, len(shape))
+
   finfo = jnp.finfo(dtype)
   nbits, nmant = finfo.bits, finfo.nmant
 
@@ -428,6 +438,8 @@ def _randint(key, shape, minval, maxval, dtype):
 
   minval = lax.convert_element_type(minval, dtype)
   maxval = lax.convert_element_type(maxval, dtype)
+  minval = lax.broadcast_to_rank(minval, len(shape))
+  maxval = lax.broadcast_to_rank(maxval, len(shape))
   nbits = jnp.iinfo(dtype).bits
 
   if nbits not in (8, 16, 32, 64):
@@ -474,7 +486,7 @@ def shuffle(key: jnp.ndarray, x: jnp.ndarray, axis: int = 0) -> jnp.ndarray:
   msg = ("jax.random.shuffle is deprecated and will be removed in a future release. "
          "Use jax.random.permutation")
   warnings.warn(msg, FutureWarning)
-  return _shuffle(key, x, axis)
+  return _shuffle(key, x, axis)  # type: ignore
 
 
 def permutation(key, x):
@@ -500,12 +512,12 @@ def permutation(key, x):
   elif np.ndim(x) == 1:
     return _shuffle(key, x, 0)
   else:
-    ind = _shuffle(key, jnp.arange(x.shape[0]), 0)
+    ind = _shuffle(key, jnp.arange(x.shape[0]), 0)  # type: ignore[attribute-error]
     return x[ind]
 
 
 @partial(jit, static_argnums=(2,))
-def _shuffle(key, x, axis):
+def _shuffle(key, x, axis) -> jnp.ndarray:
   # On parallel architectures, Fisher-Yates is more expensive than doing
   # multiple sorts. This algorithm is based on one developed and analyzed by
   # tjablin@. We sort according to randomly-generated 32bit keys, but those keys
@@ -552,13 +564,19 @@ def choice(key, a, shape=(), replace=True, p=None):
   Returns:
     An array of shape `shape` containing samples from `a`.
   """
-  a = jnp.asarray(a)
-  if a.ndim not in [0, 1]:
+  if not isinstance(shape, Sequence):
+    raise TypeError("shape argument of jax.random.choice must be a sequence, "
+                    f"got {shape}")
+  if np.ndim(a) not in [0, 1]:
     raise ValueError("a must be an integer or 1-dimensional")
-  n_inputs = int(a) if a.ndim == 0 else len(a)
-  n_draws = np.prod(shape).astype(int)
+  if np.ndim(a) == 0:
+    a = int(a)
+  else:
+    a = _asarray(a)
+  n_inputs = a if np.ndim(a) == 0 else len(a)
+  n_draws = prod(shape)
   if n_draws == 0:
-    return jnp.zeros(shape, dtype=a.dtype)
+    return jnp.zeros(shape, dtype=lax.dtype(a))
   if n_inputs <= 0:
     raise ValueError("a must be greater than 0 unless no samples are taken")
   if not replace and n_draws > n_inputs:
@@ -567,23 +585,22 @@ def choice(key, a, shape=(), replace=True, p=None):
   if p is None:
     if replace:
       ind = randint(key, shape, 0, n_inputs)
-      result = ind if a.ndim == 0 else a[ind]
+      result = ind if np.ndim(a) == 0 else a[ind]
     else:
       result = permutation(key, a)[:n_draws]
   else:
-    p = jnp.asarray(p)
     if p.shape != (n_inputs,):
       raise ValueError("p must be None or match the shape of a")
     if replace:
       p_cuml = jnp.cumsum(p)
       r = p_cuml[-1] * (1 - uniform(key, shape))
       ind = jnp.searchsorted(p_cuml, r)
-      result = ind if a.ndim == 0 else a[ind]
+      result = ind if np.ndim(a) == 0 else a[ind]
     else:
       # Gumbel top-k trick: https://timvieira.github.io/blog/post/2019/09/16/algorithms-for-sampling-without-replacement/
       g = -gumbel(key, (n_inputs,)) - jnp.log(p)
       ind = jnp.argsort(g)[:n_draws]
-      result = ind if a.ndim == 0 else a[ind]
+      result = ind if np.ndim(a) == 0 else a[ind]
   return result.reshape(shape)
 
 
@@ -607,10 +624,10 @@ def normal(key: jnp.ndarray,
                      f"got {dtype}")
   dtype = dtypes.canonicalize_dtype(dtype)
   shape = abstract_arrays.canonicalize_shape(shape)
-  return _normal(key, shape, dtype)
+  return _normal(key, shape, dtype)  # type: ignore
 
 @partial(jit, static_argnums=(1, 2))
-def _normal(key, shape, dtype):
+def _normal(key, shape, dtype) -> jnp.ndarray:
   _check_shape("normal", shape)
   lo = np.nextafter(np.array(-1., dtype), 0., dtype=dtype)
   hi = np.array(1., dtype)
@@ -649,10 +666,10 @@ def multivariate_normal(key: jnp.ndarray,
   dtype = dtypes.canonicalize_dtype(dtype)
   if shape is not None:
     shape = abstract_arrays.canonicalize_shape(shape)
-  return _multivariate_normal(key, mean, cov, shape, dtype)
+  return _multivariate_normal(key, mean, cov, shape, dtype)  # type: ignore
 
 @partial(jit, static_argnums=(3, 4))
-def _multivariate_normal(key, mean, cov, shape, dtype):
+def _multivariate_normal(key, mean, cov, shape, dtype) -> jnp.ndarray:
   if not np.ndim(mean) >= 1:
     msg = "multivariate_normal requires mean.ndim >= 1, got mean.ndim == {}"
     raise ValueError(msg.format(np.ndim(mean)))
@@ -668,11 +685,11 @@ def _multivariate_normal(key, mean, cov, shape, dtype):
   if shape is None:
     shape = lax.broadcast_shapes(mean.shape[:-1], cov.shape[:-2])
   else:
-    _check_shape("normal", shape, mean.shape[:-1], mean.shape[:-2])
+    _check_shape("normal", shape, mean.shape[:-1], cov.shape[:-2])
 
   chol_factor = cholesky(cov)
   normal_samples = normal(key, shape + mean.shape[-1:], dtype)
-  return mean + jnp.tensordot(normal_samples, chol_factor, [-1, 1])
+  return mean + jnp.einsum('...ij,...j->...i', chol_factor, normal_samples)
 
 
 def truncated_normal(key: jnp.ndarray,
@@ -705,10 +722,10 @@ def truncated_normal(key: jnp.ndarray,
   dtype = dtypes.canonicalize_dtype(dtype)
   if shape is not None:
     shape = abstract_arrays.canonicalize_shape(shape)
-  return _truncated_normal(key, lower, upper, shape, dtype)
+  return _truncated_normal(key, lower, upper, shape, dtype)  # type: ignore
 
 @partial(jit, static_argnums=(3, 4))
-def _truncated_normal(key, lower, upper, shape, dtype):
+def _truncated_normal(key, lower, upper, shape, dtype) -> jnp.ndarray:
   if shape is None:
     shape = lax.broadcast_shapes(np.shape(lower), np.shape(upper))
   else:
@@ -747,10 +764,10 @@ def bernoulli(key: jnp.ndarray,
     msg = "bernoulli probability `p` must have a floating dtype, got {}."
     raise TypeError(msg.format(dtype))
   p = lax.convert_element_type(p, dtype)
-  return _bernoulli(key, p, shape)
+  return _bernoulli(key, p, shape)  # type: ignore
 
 @partial(jit, static_argnums=(2,))
-def _bernoulli(key, p, shape):
+def _bernoulli(key, p, shape) -> jnp.ndarray:
   if shape is None:
     shape = np.shape(p)
   else:
@@ -1345,3 +1362,132 @@ def _t(key, df, shape, dtype):
   half_df = lax.div(df, two)
   g = gamma(key_n, half_df, shape, dtype)
   return n * jnp.sqrt(half_df / g)
+
+
+def rademacher(key, shape, dtype=dtypes.int_):
+  """Sample from a Rademacher distribution.
+
+  Args:
+    key: a PRNGKey key.
+    shape: The shape of the returned samples.
+    dtype: The type used for samples.
+
+  Returns:
+    A jnp.array of samples, of shape `shape`. Each element in the output has
+    a 50% change of being 1 or -1.
+
+  """
+  dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
+  return _rademacher(key, shape, dtype)
+
+
+@partial(jit, static_argnums=(1, 2))
+def _rademacher(key, shape, dtype):
+  bernoulli_samples = bernoulli(key=key, p=0.5, shape=shape)
+  return (2 * bernoulli_samples - 1).astype(dtype)
+
+
+def maxwell(key, shape=(), dtype=dtypes.float_):
+  """Sample from a one sided Maxwell distribution.
+
+  The scipy counterpart is `scipy.stats.maxwell`.
+
+  Args:
+    key: a PRNGKey key.
+    shape: The shape of the returned samples.
+    dtype: The type used for samples.
+
+  Returns:
+    A jnp.array of samples, of shape `shape`.
+
+  """
+  # Generate samples using:
+  # sqrt(X^2 + Y^2 + Z^2), X,Y,Z ~N(0,1)
+  if not dtypes.issubdtype(dtype, np.floating):
+    raise ValueError(f"dtype argument to `maxwell` must be a float "
+                     f"dtype, got {dtype}")
+  dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
+  return _maxwell(key, shape, dtype)
+
+
+@partial(jit, static_argnums=(1, 2))
+def _maxwell(key, shape, dtype):
+  shape = shape + (3,)
+  norm_rvs = normal(key=key, shape=shape, dtype=dtype)
+  return jnp.linalg.norm(norm_rvs, axis=-1)
+
+
+def double_sided_maxwell(key, loc, scale, shape=(), dtype=dtypes.float_):
+  """Sample from a double sided Maxwell distribution.
+
+  Samples using:
+     loc + scale* sgn(U-0.5)* one_sided_maxwell U~Unif;
+
+  Args:
+    key: a PRNGKey key.
+    loc: The location parameter of the distribution.
+    scale: The scale parameter of the distribution.
+    shape: The shape added to the parameters loc and scale broadcastable shape.
+    dtype: The type used for samples.
+
+  Returns:
+    A jnp.array of samples.
+
+  """
+  if not dtypes.issubdtype(dtype, np.floating):
+    raise ValueError(f"dtype argument to `double_sided_maxwell` must be a float"
+                     f" dtype, got {dtype}")
+  dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
+  return _double_sided_maxwell(key, loc, scale, shape, dtype)
+
+
+@partial(jit, static_argnums=(1, 2, 3, 4))
+def _double_sided_maxwell(key, loc, scale, shape, dtype):
+  params_shapes = lax.broadcast_shapes(np.shape(loc), np.shape(scale))
+  if not shape:
+    shape = params_shapes
+
+  shape = shape + params_shapes
+  maxwell_key, rademacher_key = split(key)
+  maxwell_rvs = maxwell(maxwell_key, shape=shape, dtype=dtype)
+  # Generate random signs for the symmetric variates.
+  random_sign = rademacher(rademacher_key, shape=shape, dtype=dtype)
+  assert random_sign.shape == maxwell_rvs.shape
+
+  return random_sign * maxwell_rvs * scale + loc
+
+
+def weibull_min(key, scale, concentration, shape=(), dtype=dtypes.float_):
+  """Sample from a Weibull distribution.
+
+  The scipy counterpart is `scipy.stats.weibull_min`.
+
+  Args:
+    key: a PRNGKey key.
+    scale: The scale parameter of the distribution.
+    concentration: The concentration parameter of the distribution.
+    shape: The shape added to the parameters loc and scale broadcastable shape.
+    dtype: The type used for samples.
+
+  Returns:
+    A jnp.array of samples.
+
+  """
+  if not dtypes.issubdtype(dtype, np.floating):
+    raise ValueError(f"dtype argument to `weibull_min` must be a float "
+                     f"dtype, got {dtype}")
+  dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
+  return _weibull_min(key, scale, concentration, shape, dtype)
+
+
+@partial(jit, static_argnums=(1, 2, 3, 4))
+def _weibull_min(key, scale, concentration, shape, dtype):
+  random_uniform = uniform(
+      key=key, shape=shape, minval=0, maxval=1, dtype=dtype)
+
+  # Inverse weibull CDF.
+  return jnp.power(-jnp.log1p(-random_uniform), 1.0/concentration) * scale

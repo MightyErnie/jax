@@ -33,7 +33,7 @@ from . import core
 from . import dtypes as _dtypes
 from . import lax
 from .config import flags, bool_env
-from .util import partial
+from .util import partial, prod
 from .tree_util import tree_multimap, tree_all, tree_map, tree_reduce
 from .lib import xla_bridge
 from .interpreters import xla
@@ -354,8 +354,8 @@ def if_device_under_test(device_type: Union[str, Sequence[str]],
 
 def supported_dtypes():
   if device_under_test() == "tpu":
-    types = {np.bool_, np.int32, np.uint32, _dtypes.bfloat16, np.float16,
-             np.float32, np.complex64}
+    types = {np.bool_, np.int8, np.int16, np.int32, np.uint8, np.uint16,
+             np.uint32, _dtypes.bfloat16, np.float16, np.float32, np.complex64}
   else:
     types = {np.bool_, np.int8, np.int16, np.int32, np.int64,
              np.uint8, np.uint16, np.uint32, np.uint64,
@@ -366,9 +366,10 @@ def supported_dtypes():
   return types
 
 def skip_if_unsupported_type(dtype):
-  if dtype not in supported_dtypes():
+  dtype = np.dtype(dtype)
+  if dtype.type not in supported_dtypes():
     raise unittest.SkipTest(
-      f"Type {dtype} not supported on {device_under_test()}")
+      f"Type {dtype.name} not supported on {device_under_test()}")
 
 def skip_on_devices(*disabled_devices):
   """A decorator for test methods to skip the test on certain devices."""
@@ -673,7 +674,7 @@ def rand_int(rng, low=0, high=None):
 
 def rand_unique_int(rng, high=None):
   def fn(shape, dtype):
-    return rng.choice(np.arange(high or np.prod(shape), dtype=dtype),
+    return rng.choice(np.arange(high or prod(shape), dtype=dtype),
                       size=shape, replace=False)
   return fn
 
